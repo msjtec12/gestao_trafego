@@ -148,6 +148,35 @@ export function decryptVaultCredentialWithMandatoryAad(params: {
   });
 }
 
+/**
+ * Planned key rotation helper: decrypts an existing credential using its embedded
+ * key version in `keyRing` (verifying AAD integrity) and re-encrypts it under `targetKeyVersion`.
+ */
+export function rotateVaultCredentialKeyVersion(params: {
+  readonly cipherPayload: string;
+  readonly keyRing: KeyRing;
+  readonly targetKeyVersion: string;
+  readonly aad: CredentialAadContext;
+}): { readonly rotatedCipherPayload: string; readonly keyVersion: string } {
+  const plainText = decryptVaultCredentialWithMandatoryAad({
+    cipherPayload: params.cipherPayload,
+    keyRing: params.keyRing,
+    aad: params.aad,
+  });
+
+  const rotatedCipherPayload = encryptVaultCredentialWithMandatoryAad({
+    plainText,
+    keyRing: params.keyRing,
+    keyVersion: params.targetKeyVersion,
+    aad: params.aad,
+  });
+
+  return {
+    rotatedCipherPayload,
+    keyVersion: params.targetKeyVersion,
+  };
+}
+
 export function decryptCredential(
   cipherPayload: string,
   hexKey64OrKeyRing: string | KeyRing,

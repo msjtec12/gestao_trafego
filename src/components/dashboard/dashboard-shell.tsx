@@ -1,18 +1,25 @@
 "use client";
 
 import * as React from "react";
+import { useRouter } from "next/navigation";
 import type {
   AdAccountRecordViewModel,
+  AuditEventViewModel,
   ClientRecordViewModel,
   IntegrationHealthViewModel,
   MemberRecordViewModel,
   OrganizationOption,
+  SyncRunViewModel,
 } from "@/application/use-cases/dashboard-overview-use-case";
 import type {
   NormalizedCampaign,
   NormalizedDailyMetric,
 } from "@/integrations/contracts/advertising-provider";
 import type { AIRecommendation } from "@/modules/ai/schemas/recommendation-schemas";
+import {
+  switchOrganizationAction,
+  toggleEmergencyStopServerAction,
+} from "@/app/actions/operational-actions";
 import { AppSidebar } from "./app-sidebar";
 import { MobileNavigation } from "./mobile-navigation";
 import { DashboardHeader } from "./dashboard-header";
@@ -24,11 +31,16 @@ import { CommandPalette } from "./command-palette";
 export interface DashboardShellProps {
   readonly organizationName: string;
   readonly organizationId: string;
+  readonly authenticatedUserEmail?: string;
+  readonly isDemoEnvironment?: boolean;
+  readonly emergencyStopActive?: boolean;
   readonly organizations?: readonly OrganizationOption[];
   readonly clients?: readonly ClientRecordViewModel[];
   readonly adAccounts?: readonly AdAccountRecordViewModel[];
   readonly members?: readonly MemberRecordViewModel[];
   readonly integrations?: readonly IntegrationHealthViewModel[];
+  readonly syncHistory?: readonly SyncRunViewModel[];
+  readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
@@ -63,16 +75,22 @@ const DEFAULT_DOMAIN_TABLES = [
 export function DashboardShell({
   organizationName,
   organizationId,
+  authenticatedUserEmail,
+  isDemoEnvironment = true,
+  emergencyStopActive: initialEmergencyStop = false,
   organizations: initialOrgs,
-  clients: initialClients = [],
-  adAccounts: initialAccounts = [],
-  members: initialMembers = [],
-  integrations: initialIntegrations = [],
+  clients = [],
+  adAccounts = [],
+  members = [],
+  integrations = [],
+  syncHistory = [],
+  auditTrail = [],
   campaigns,
   dailyMetrics,
   recommendations,
   domainTables = DEFAULT_DOMAIN_TABLES,
 }: DashboardShellProps) {
+  const router = useRouter();
   const defaultOrgs: readonly OrganizationOption[] = React.useMemo(
     () =>
       initialOrgs && initialOrgs.length > 0
@@ -87,31 +105,22 @@ export function DashboardShell({
               currencyCode: "BRL",
               maxDailyBudgetChangePct: 20,
               minCooldownMinutes: 360,
-              isDemo: true,
+              isDemo: isDemoEnvironment,
             },
           ],
-    [initialOrgs, organizationId, organizationName]
+    [initialOrgs, organizationId, organizationName, isDemoEnvironment]
   );
 
   const [selectedOrgId, setSelectedOrgId] = React.useState(
-    defaultOrgs[0]!.id
+    organizationId || defaultOrgs[0]!.id
   );
-  const [clientsList, setClientsList] =
-    React.useState<readonly ClientRecordViewModel[]>(initialClients);
-  const [accountsList, setAccountsList] =
-    React.useState<readonly AdAccountRecordViewModel[]>(initialAccounts);
-  const [integrationsList, setIntegrationsList] =
-    React.useState<readonly IntegrationHealthViewModel[]>(initialIntegrations);
-  const [isSyncing, setIsSyncing] = React.useState(false);
-  const [lastSyncTimestamp, setLastSyncTimestamp] = React.useState<
-    string | null
-  >("26/11/2026 10:15:00 (Checkpoint ckpt-mock-20261126-v2)");
-
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [activeSection, setActiveSection] = React.useState("overview");
   const [commandOpen, setCommandOpen] = React.useState(false);
-  const [emergencyStopActive, setEmergencyStopActive] = React.useState(false);
+  const [emergencyStopActive, setEmergencyStopActive] = React.useState(
+    initialEmergencyStop
+  );
 
   const activeOrganization = React.useMemo(
     () =>
@@ -119,17 +128,28 @@ export function DashboardShell({
     [defaultOrgs, selectedOrgId]
   );
 
-  const scopedClients = React.useMemo(
-    () =>
-      clientsList.filter((c) => c.organizationId === activeOrganization.id),
-    [clientsList, activeOrganization.id]
+  const handleSelectOrganizationId = React.useCallback(
+    async (nextOrgId: string) => {
+      setSelectedOrgId(nextOrgId);
+      if (!isDemoEnvironment) {
+        await switchOrganizationAction(nextOrgId);
+        router.refresh();
+      }
+    },
+    [isDemoEnvironment, router]
   );
 
-  const scopedAccounts = React.useMemo(
-    () =>
-      accountsList.filter((a) => a.organizationId === activeOrganization.id),
-    [accountsList, activeOrganization.id]
-  );
+  const handleToggleEmergencyStop = React.useCallback(async () => {
+    if (!isDemoEnvironment) {
+      const res = await toggleEmergencyStopServerAction();
+      if (res.ok && res.emergencyStopActive !== undefined) {
+        setEmergencyStopActive(res.emergencyStopActive);
+        router.refresh();
+        return;
+      }
+    }
+    setEmergencyStopActive((prev) => !prev);
+  }, [isDemoEnvironment, router]);
 
   const scrollToSection = React.useCallback((sectionId: string) => {
     setActiveSection(sectionId);
@@ -140,15 +160,17 @@ export function DashboardShell({
     }
   }, []);
 
-  const handleTriggerIncrementalSync = React.useCallback(() => {
-    setIsSyncing(true);
-    setTimeout(() => {
-      setIsSyncing(false);
-      setLastSyncTimestamp(
-        `${new Date().toLocaleTimeString("pt-BR")} (Checkpoint incremental atualizado)`
-      );
-    }, 350);
-  }, []);
+  const lastSyncTimestamp = React.useMemo(() => {
+    if (syncHistory[0]?.completedAtIso) {
+      return `${syncHistory[0].completedAtIso} (Checkpoint: ${
+        syncHistory[0].checkpointToken ?? "N/D"
+      })`;
+    }
+    if (activeOrganization.isDemo) {
+      return "26/11/2026 10:15:00 (Checkpoint ckpt-mock-20261126-v2)";
+    }
+    return null;
+  }, [syncHistory, activeOrganization.isDemo]);
 
   return (
     <div className="min-h-screen flex bg-slate-50 dark:bg-[#060d1a] text-slate-900 dark:text-slate-100 overflow-x-hidden">
@@ -174,60 +196,33 @@ export function DashboardShell({
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
           onOpenCommandPalette={() => setCommandOpen(true)}
           emergencyStopActive={emergencyStopActive}
-          onToggleEmergencyStop={() =>
-            setEmergencyStopActive((prev) => !prev)
-          }
+          onToggleEmergencyStop={handleToggleEmergencyStop}
+          authenticatedUserEmail={authenticatedUserEmail}
         />
 
-        <DemoModeBanner />
+        {activeOrganization.isDemo && <DemoModeBanner />}
 
         <EmergencyStopAlertBanner
           emergencyStopActive={emergencyStopActive}
-          onRestore={() => setEmergencyStopActive(false)}
+          onRestore={handleToggleEmergencyStop}
         />
 
         <DashboardOverview
           organizationName={activeOrganization.name}
           activeOrganization={activeOrganization}
           organizations={defaultOrgs}
-          onSelectOrganizationId={setSelectedOrgId}
-          clients={scopedClients}
-          adAccounts={scopedAccounts}
-          members={initialMembers}
-          integrations={integrationsList}
+          onSelectOrganizationId={handleSelectOrganizationId}
+          clients={clients}
+          adAccounts={adAccounts}
+          members={members}
+          integrations={integrations}
+          syncHistory={syncHistory}
+          auditTrail={auditTrail}
           campaigns={campaigns}
           dailyMetrics={dailyMetrics}
           recommendations={recommendations}
           domainTables={domainTables}
           emergencyStopActive={emergencyStopActive}
-          onClientCreated={(newClient) =>
-            setClientsList((prev) => [newClient, ...prev])
-          }
-          onToggleAccountSelection={(accId) =>
-            setAccountsList((prev) =>
-              prev.map((a) =>
-                a.id === accId
-                  ? { ...a, isSelectedForSync: !a.isSelectedForSync }
-                  : a
-              )
-            )
-          }
-          onRevokeIntegration={(intId) =>
-            setIntegrationsList((prev) =>
-              prev.map((i) =>
-                i.id === intId
-                  ? {
-                      ...i,
-                      status: "REVOKED",
-                      message:
-                        "Integração revogada pelo administrador. Tokens removidos do Credential Vault.",
-                    }
-                  : i
-              )
-            )
-          }
-          onTriggerIncrementalSync={handleTriggerIncrementalSync}
-          isSyncing={isSyncing}
           lastSyncTimestamp={lastSyncTimestamp}
         />
       </div>
@@ -236,7 +231,7 @@ export function DashboardShell({
         open={commandOpen}
         onOpenChange={setCommandOpen}
         onSelectSection={scrollToSection}
-        onTriggerKillSwitch={() => setEmergencyStopActive((prev) => !prev)}
+        onTriggerKillSwitch={handleToggleEmergencyStop}
       />
     </div>
   );

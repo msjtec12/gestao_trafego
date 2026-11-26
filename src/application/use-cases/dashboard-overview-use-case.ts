@@ -1,4 +1,12 @@
+import { eq, inArray } from "drizzle-orm";
 import type { AdProviderType, UserRole } from "@/domain/types";
+import { getOperationalPostgresRuntime } from "@/infrastructure/db";
+import * as schema from "@/infrastructure/db/schema";
+import {
+  PersistentDrizzleTenantRepository,
+  resolveSessionFromPostgres,
+  type AggregatedPeriodMetricsResult,
+} from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
 import {
   GoogleAdsProvider,
   MockAdsProvider,
@@ -23,6 +31,7 @@ export interface OrganizationOption {
   readonly currencyCode: string;
   readonly maxDailyBudgetChangePct: number;
   readonly minCooldownMinutes: number;
+  readonly emergencyStopActive?: boolean;
   readonly isDemo: boolean;
 }
 
@@ -69,7 +78,13 @@ export interface IntegrationHealthViewModel {
   readonly organizationId: string;
   readonly provider: AdProviderType;
   readonly label: string;
-  readonly status: "CONNECTED" | "EXPIRED" | "REVOKED" | "ERROR" | "SANDBOX_DEMO" | "BLOCKED_MISSING_CREDENTIALS";
+  readonly status:
+    | "CONNECTED"
+    | "EXPIRED"
+    | "REVOKED"
+    | "ERROR"
+    | "SANDBOX_DEMO"
+    | "BLOCKED_MISSING_CREDENTIALS";
   readonly mode: "READ_ONLY";
   readonly managerCustomerId: string | null;
   readonly lastSyncedAtIso: string | null;
@@ -79,12 +94,37 @@ export interface IntegrationHealthViewModel {
   readonly isDemoData: boolean;
 }
 
+export interface SyncRunViewModel {
+  readonly id: string;
+  readonly integrationId: string;
+  readonly provider: AdProviderType;
+  readonly status: string;
+  readonly checkpointToken: string | null;
+  readonly entitiesSynced: Record<string, number>;
+  readonly startedAtIso: string;
+  readonly completedAtIso: string | null;
+  readonly errorCode: string | null;
+}
+
+export interface AuditEventViewModel {
+  readonly id: string;
+  readonly timestamp: string;
+  readonly action: string;
+  readonly entityType: string;
+  readonly entityId: string;
+  readonly detail: string;
+}
+
 export interface DashboardOverviewViewModel {
   readonly organizationName: string;
   readonly organizationId: string;
+  readonly authenticatedUserEmail?: string;
+  readonly authenticatedUserName?: string;
+  readonly authenticatedUserRole?: UserRole;
   readonly defaultExecutionMode: "READ_ONLY";
   readonly isDemoEnvironment: boolean;
-  readonly isServerKillSwitchPersisted: false;
+  readonly isServerKillSwitchPersisted: boolean;
+  readonly emergencyStopActive: boolean;
   readonly organizations: readonly OrganizationOption[];
   readonly clients: readonly ClientRecordViewModel[];
   readonly adAccounts: readonly AdAccountRecordViewModel[];
@@ -92,10 +132,297 @@ export interface DashboardOverviewViewModel {
   readonly integrations: readonly IntegrationHealthViewModel[];
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
+  readonly aggregatedMetrics?: AggregatedPeriodMetricsResult;
+  readonly syncHistory?: readonly SyncRunViewModel[];
+  readonly auditTrail?: readonly AuditEventViewModel[];
   readonly recommendations: AIRecommendation[];
   readonly domainTables: readonly string[];
 }
 
+/**
+ * Loads the authenticated operational dashboard state strictly from PostgreSQL.
+ * NEVER falls back to MockAdsProvider or fake demo metrics when no accounts are connected.
+ */
+export async function getAuthenticatedOperationalDashboardUseCase(params: {
+  readonly sessionToken: string;
+  readonly clientId?: string;
+  readonly adAccountId?: string;
+  readonly periodDays?: number;
+}): Promise<DashboardOverviewViewModel> {
+  const { db } = await getOperationalPostgresRuntime();
+  const session = await resolveSessionFromPostgres(db, {
+    sessionToken: params.sessionToken,
+  });
+
+  const repo = new PersistentDrizzleTenantRepository(db);
+  const activeOrgRow = await repo.getOrganization(session.context);
+  const clientRows = await repo.listClients(session.context);
+  const accountRows = await repo.listAdAccounts(session.context, {
+    clientId: params.clientId,
+  });
+  const integrationRows = await repo.listPublicIntegrations(session.context);
+  const campaignRows = await repo.listCampaigns(session.context, {
+    clientId: params.clientId,
+    adAccountId: params.adAccountId,
+  });
+  const syncRunRows = await repo.listSyncRuns(session.context);
+  const auditRows = await repo.listAuditLogs(session.context, 25);
+
+  const aggregated = await repo.getAggregatedDashboardMetrics(session.context, {
+    clientId: params.clientId,
+    adAccountId: params.adAccountId,
+    periodDays: params.periodDays ?? 7,
+  });
+
+  // Load organization memberships + user details
+  const orgMemberships: (typeof schema.memberships.$inferSelect)[] = await db
+    .select()
+    .from(schema.memberships)
+    .where(eq(schema.memberships.organizationId, session.context.organizationId));
+
+  const memberUserIds = orgMemberships.map((m) => m.userId);
+  const userRows: (typeof schema.users.$inferSelect)[] =
+    memberUserIds.length > 0
+      ? await db
+          .select()
+          .from(schema.users)
+          .where(inArray(schema.users.id, memberUserIds))
+      : [];
+
+  const clientAccessRows: (typeof schema.memberClientAccess.$inferSelect)[] =
+    await db
+      .select()
+      .from(schema.memberClientAccess)
+      .where(
+        eq(
+          schema.memberClientAccess.organizationId,
+          session.context.organizationId
+        )
+      );
+
+  const clientMap = new Map(clientRows.map((c) => [c.id, c]));
+  const accountMap = new Map(accountRows.map((a) => [a.id, a]));
+
+  // Map persisted campaigns with their persisted daily_metrics
+  const campaignIds = campaignRows.map((c) => c.id);
+  const persistedDailyMetrics: (typeof schema.dailyMetrics.$inferSelect)[] =
+    campaignIds.length > 0
+      ? await db
+          .select()
+          .from(schema.dailyMetrics)
+          .where(inArray(schema.dailyMetrics.campaignId, campaignIds))
+      : [];
+
+  const normalizedCampaigns: NormalizedCampaign[] = campaignRows.map((c) => {
+    const acc = accountMap.get(c.adAccountId);
+    const cli = acc ? clientMap.get(acc.clientId) : undefined;
+    const campMetrics = persistedDailyMetrics.filter(
+      (m) => m.campaignId === c.id
+    );
+
+    const spendCents = campMetrics.reduce(
+      (sum, m) => sum + Number(m.costCents),
+      0
+    );
+    const conversions = campMetrics.reduce(
+      (sum, m) => sum + Number(m.conversions),
+      0
+    );
+    const convValueCents = campMetrics.reduce(
+      (sum, m) => sum + Number(m.conversionValueCents),
+      0
+    );
+    const impressions = campMetrics.reduce(
+      (sum, m) => sum + Number(m.impressions),
+      0
+    );
+    const clicks = campMetrics.reduce((sum, m) => sum + Number(m.clicks), 0);
+
+    const spendBrl = Number((spendCents / 100).toFixed(2));
+    const cpaBrl =
+      conversions > 0 ? Number((spendBrl / conversions).toFixed(2)) : 0;
+    const roas =
+      spendCents > 0 ? Number((convValueCents / spendCents).toFixed(2)) : 0;
+    const ctrPct =
+      impressions > 0 ? Number(((clicks / impressions) * 100).toFixed(2)) : 0;
+
+    return {
+      id: c.id,
+      organizationId: c.organizationId,
+      clientId: acc?.clientId,
+      externalCampaignId: c.externalCampaignId,
+      clientName: cli?.name ?? "Cliente Associado",
+      name: c.name,
+      provider: c.provider,
+      channelType:
+        (c.channelType as NormalizedCampaign["channelType"]) ?? "SEARCH",
+      status: c.status,
+      biddingStrategy: c.biddingStrategy,
+      dailyBudgetBrl: Number((Number(c.dailyBudgetCents) / 100).toFixed(2)),
+      spend7dBrl: spendBrl,
+      conversions7d: conversions,
+      cpa7dBrl: cpaBrl,
+      roas7d: roas,
+      ctr7dPct: ctrPct,
+      impressions7d: impressions,
+      clicks7d: clicks,
+      isDemoData: c.isDemoData,
+      lastAutomatedChangeAt: c.lastAutomatedChangeAt
+        ? c.lastAutomatedChangeAt.toISOString()
+        : null,
+    };
+  });
+
+  const hasLiveGoogleCredentials = Boolean(
+    process.env.GOOGLE_ADS_CLIENT_ID &&
+      !process.env.GOOGLE_ADS_CLIENT_ID.startsWith("replace_with_")
+  );
+
+  const integrationsVm: IntegrationHealthViewModel[] = integrationRows.map(
+    (intg) => ({
+      id: intg.id,
+      organizationId: intg.organizationId,
+      provider: intg.provider,
+      label: intg.externalAccountLabel,
+      status:
+        intg.status === "REVOKED"
+          ? "REVOKED"
+          : intg.status === "CONNECTED"
+            ? "CONNECTED"
+            : intg.isDemoIntegration
+              ? "SANDBOX_DEMO"
+              : hasLiveGoogleCredentials
+                ? intg.status
+                : "BLOCKED_MISSING_CREDENTIALS",
+      mode: "READ_ONLY",
+      managerCustomerId: intg.managerCustomerId,
+      lastSyncedAtIso: intg.lastSyncedAt
+        ? intg.lastSyncedAt.toISOString()
+        : null,
+      lastCheckpoint: intg.lastCheckpointToken ?? null,
+      latencyMs: 0,
+      message:
+        intg.status === "REVOKED"
+          ? "Credenciais revogadas e removidas do Credential Vault."
+          : intg.status === "CONNECTED"
+            ? "Integração OAuth 2.0 ativa no PostgreSQL Credential Vault (AES-256-GCM + AAD)."
+            : "Bloqueado de forma transparente: GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_CLIENT_SECRET não configurados com credenciais oficiais. Nenhuma conexão falsa é simulada.",
+      isDemoData: intg.isDemoIntegration,
+    })
+  );
+
+  const organizationsVm: OrganizationOption[] =
+    session.availableOrganizations.map((org) => ({
+      id: org.id,
+      name: org.name,
+      slug: org.slug,
+      executionMode: "READ_ONLY",
+      timezone: activeOrgRow.timezone,
+      currencyCode: activeOrgRow.currencyCode,
+      maxDailyBudgetChangePct: activeOrgRow.maxDailyBudgetChangePct,
+      minCooldownMinutes: activeOrgRow.minCooldownMinutes,
+      emergencyStopActive: activeOrgRow.emergencyStopActive,
+      isDemo: false,
+    }));
+
+  const clientsVm: ClientRecordViewModel[] = clientRows.map((c) => ({
+    id: c.id,
+    organizationId: c.organizationId,
+    name: c.name,
+    industry: c.industry,
+    monthlyBudgetCapBrl: Number((Number(c.monthlyBudgetCapCents) / 100).toFixed(2)),
+    targetCpaBrl: c.targetCpaCents
+      ? Number((c.targetCpaCents / 100).toFixed(2))
+      : null,
+    targetRoas: c.targetRoas ? Number(c.targetRoas) : null,
+    isActive: c.isActive,
+    isDemoData: false,
+  }));
+
+  const adAccountsVm: AdAccountRecordViewModel[] = accountRows.map((a) => ({
+    id: a.id,
+    organizationId: a.organizationId,
+    clientId: a.clientId,
+    clientName: clientMap.get(a.clientId)?.name ?? "Cliente",
+    provider: a.provider,
+    externalAccountId: a.externalAccountId,
+    managerCustomerId: a.managerCustomerId,
+    isMccAccount: a.isMccAccount,
+    isSelectedForSync: a.isSelectedForSync,
+    name: a.name,
+    currencyCode: a.currencyCode,
+    timezone: a.timezone,
+    isDemoData: a.isDemoData,
+  }));
+
+  const membersVm: MemberRecordViewModel[] = orgMemberships.map((m) => {
+    const u = userRows.find((usr) => usr.id === m.userId);
+    const assignedClients = clientAccessRows
+      .filter((ca) => ca.membershipId === m.id)
+      .map((ca) => ca.clientId);
+    return {
+      id: m.id,
+      organizationId: m.organizationId,
+      userId: m.userId,
+      fullName: u?.fullName ?? "Usuário",
+      email: u?.email ?? "",
+      role: m.role,
+      allowedClientIds:
+        m.role === "CLIENT_VIEWER"
+          ? assignedClients
+          : clientsVm.map((c) => c.id),
+    };
+  });
+
+  const syncHistoryVm: SyncRunViewModel[] = syncRunRows.map((sr) => ({
+    id: sr.id,
+    integrationId: sr.integrationId,
+    provider: sr.provider,
+    status: sr.status,
+    checkpointToken: sr.checkpointToken,
+    entitiesSynced: sr.entitiesSynced,
+    startedAtIso: sr.startedAt.toISOString(),
+    completedAtIso: sr.completedAt ? sr.completedAt.toISOString() : null,
+    errorCode: sr.errorCode,
+  }));
+
+  const auditTrailVm: AuditEventViewModel[] = auditRows.map((ar) => ({
+    id: ar.id,
+    timestamp: ar.createdAt.toISOString().slice(0, 19).replace("T", " "),
+    action: ar.action,
+    entityType: ar.entityType,
+    entityId: ar.entityId,
+    detail: JSON.stringify(ar.newState ?? {}),
+  }));
+
+  return {
+    organizationName: activeOrgRow.name,
+    organizationId: activeOrgRow.id,
+    authenticatedUserEmail: session.user.email,
+    authenticatedUserName: session.user.fullName,
+    authenticatedUserRole: session.context.role,
+    defaultExecutionMode: "READ_ONLY",
+    isDemoEnvironment: false,
+    isServerKillSwitchPersisted: true,
+    emergencyStopActive: activeOrgRow.emergencyStopActive,
+    organizations: organizationsVm,
+    clients: clientsVm,
+    adAccounts: adAccountsVm,
+    members: membersVm,
+    integrations: integrationsVm,
+    campaigns: normalizedCampaigns,
+    dailyMetrics: [...aggregated.timeline],
+    aggregatedMetrics: aggregated,
+    syncHistory: syncHistoryVm,
+    auditTrail: auditTrailVm,
+    recommendations: [],
+    domainTables: ALL_DOMAIN_TABLES,
+  };
+}
+
+/**
+ * Isolated public demo view model used exclusively by `/demo`.
+ */
 export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewViewModel> {
   const mockProvider = new MockAdsProvider();
   const googleProvider = new GoogleAdsProvider();
@@ -107,13 +434,6 @@ export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewVi
     googleProvider.checkHealth(),
   ]);
   const recommendations = getDemoAIRecommendations(DEMO_ORGANIZATION.id);
-
-  const hasLiveGoogleCredentials = Boolean(
-    process.env.GOOGLE_ADS_CLIENT_ID &&
-      !process.env.GOOGLE_ADS_CLIENT_ID.startsWith("replace_with_") &&
-      process.env.GOOGLE_ADS_DEVELOPER_TOKEN &&
-      !process.env.GOOGLE_ADS_DEVELOPER_TOKEN.startsWith("replace_with_")
-  );
 
   const organizations: readonly OrganizationOption[] = [
     {
@@ -240,66 +560,6 @@ export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewVi
       timezone: "America/Sao_Paulo",
       isDemoData: true,
     },
-    {
-      id: "acc-demo-gads-fiscaltech",
-      organizationId: DEMO_ORGANIZATION.id,
-      clientId: "client-fiscaltech",
-      clientName: "Escritório Contábil FiscalTech B2B",
-      provider: "MOCK_ADS",
-      externalAccountId: "402-881-9003",
-      managerCustomerId: "990-100-2000",
-      isMccAccount: false,
-      isSelectedForSync: true,
-      name: "[DEMO] Google Ads — FiscalTech B2B",
-      currencyCode: "BRL",
-      timezone: "America/Sao_Paulo",
-      isDemoData: true,
-    },
-    {
-      id: "acc-demo-meta-lumina",
-      organizationId: DEMO_ORGANIZATION.id,
-      clientId: "client-lumina-estetica",
-      clientName: "Studio Estética Avançada Lumina",
-      provider: "MOCK_ADS",
-      externalAccountId: "ACT-8830199",
-      managerCustomerId: null,
-      isMccAccount: false,
-      isSelectedForSync: true,
-      name: "[DEMO] Meta Ads — Studio Lumina",
-      currencyCode: "BRL",
-      timezone: "America/Sao_Paulo",
-      isDemoData: true,
-    },
-    {
-      id: "acc-demo-gads-petvida",
-      organizationId: DEMO_ORGANIZATION.id,
-      clientId: "client-petvida",
-      clientName: "Hospital Veterinário 24h PetVida",
-      provider: "MOCK_ADS",
-      externalAccountId: "402-881-9005",
-      managerCustomerId: "990-100-2000",
-      isMccAccount: false,
-      isSelectedForSync: true,
-      name: "[DEMO] Google Ads — Hospital PetVida 24h",
-      currencyCode: "BRL",
-      timezone: "America/Sao_Paulo",
-      isDemoData: true,
-    },
-    {
-      id: "acc-demo-gads-primehouse",
-      organizationId: DEMO_ORGANIZATION.id,
-      clientId: "client-primehouse",
-      clientName: "Imobiliária Alto Padrão PrimeHouse",
-      provider: "MOCK_ADS",
-      externalAccountId: "402-881-9006",
-      managerCustomerId: "990-100-2000",
-      isMccAccount: false,
-      isSelectedForSync: true,
-      name: "[DEMO] Google Ads — Imobiliária PrimeHouse",
-      currencyCode: "BRL",
-      timezone: "America/Sao_Paulo",
-      isDemoData: true,
-    },
   ];
 
   const members: readonly MemberRecordViewModel[] = [
@@ -310,33 +570,6 @@ export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewVi
       fullName: "Massami Shitara (Principal Owner)",
       email: "owner@konnexy.com.br",
       role: "OWNER",
-      allowedClientIds: clients.map((c) => c.id),
-    },
-    {
-      id: "mem-admin-02",
-      organizationId: DEMO_ORGANIZATION.id,
-      userId: "user-admin-02",
-      fullName: "Helena Costa (Head de Operações)",
-      email: "helena.admin@konnexy.com.br",
-      role: "ADMIN",
-      allowedClientIds: clients.map((c) => c.id),
-    },
-    {
-      id: "mem-traffic-03",
-      organizationId: DEMO_ORGANIZATION.id,
-      userId: "user-traffic-03",
-      fullName: "Lucas Mendes (Gestor de Tráfego Sênior)",
-      email: "lucas.trafego@konnexy.com.br",
-      role: "TRAFFIC_MANAGER",
-      allowedClientIds: clients.map((c) => c.id),
-    },
-    {
-      id: "mem-analyst-04",
-      organizationId: DEMO_ORGANIZATION.id,
-      userId: "user-analyst-04",
-      fullName: "Marina Rocha (Analista de BI & Mídia)",
-      email: "marina.bi@konnexy.com.br",
-      role: "ANALYST",
       allowedClientIds: clients.map((c) => c.id),
     },
     {
@@ -355,18 +588,15 @@ export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewVi
       id: "int-google-ads-prod",
       organizationId: DEMO_ORGANIZATION.id,
       provider: "GOOGLE_ADS",
-      label: "Google Ads API v19 (OAuth 2.0 + MCC Read-Only)",
-      status: hasLiveGoogleCredentials
-        ? "CONNECTED"
-        : "BLOCKED_MISSING_CREDENTIALS",
+      label: "Google Ads API v26 (OAuth 2.0 + MCC Read-Only)",
+      status: "BLOCKED_MISSING_CREDENTIALS",
       mode: "READ_ONLY",
       managerCustomerId: "990-100-2000",
       lastSyncedAtIso: null,
       lastCheckpoint: null,
       latencyMs: googleHealth.latencyMs,
-      message: hasLiveGoogleCredentials
-        ? "Credenciais OAuth 2.0 configuradas em modo READ_ONLY."
-        : "Bloqueado de forma transparente: GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_DEVELOPER_TOKEN não configurados no ambiente. Nenhuma conexão real é simulada.",
+      message:
+        "Bloqueado de forma transparente: GOOGLE_ADS_CLIENT_ID não configurado no ambiente. Nenhuma conexão real é simulada.",
       isDemoData: false,
     },
     {
@@ -391,6 +621,7 @@ export async function getDashboardOverviewUseCase(): Promise<DashboardOverviewVi
     defaultExecutionMode: "READ_ONLY",
     isDemoEnvironment: true,
     isServerKillSwitchPersisted: false,
+    emergencyStopActive: false,
     organizations,
     clients,
     adAccounts,

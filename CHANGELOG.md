@@ -5,6 +5,24 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
+## [0.2.1] - 2026-11-26 — Stage 2.1: Operational Completion
+
+### Adicionado & Persistido em PostgreSQL
+- **Autenticação Operacional & Separação de Ambientes**:
+  - Páginas operacionais `/login` e `/onboarding`, Server Actions autenticadas (`src/app/actions/operational-actions.ts`) e proteção de rotas privadas via `src/middleware.ts`.
+  - Tabela `user_sessions` (com revogação explícita no logout e expiração) e `auth_rate_limits` (`PersistentPostgresAuthRateLimiter`) persistidas no PostgreSQL.
+  - Separação total entre o Dashboard Operacional Autenticado (`/`, sem fallback silencioso para dados fictícios) e o Ambiente Demonstrativo Público (`/demo`).
+- **Google Ads OAuth 2.0 Persistente, Credential Vault Rotation & Transporte IP-Pinned**:
+  - Tabela PostgreSQL `oauth_states` com RLS e garantia estrita de uso único (`consumed_at`) para `state` + `code_verifier` PKCE.
+  - Route Handlers `/api/integrations/google-ads/authorize` e `/api/integrations/google-ads/callback`.
+  - `PersistentPostgresGoogleAdsService` com rotação planejada de chaves (`v1` → `v2`) no banco, refresh de access token, revogação persistente e consultas REST Google Ads API `v26` (`customers:listAccessibleCustomers` e `googleAds:search` estritamente `SELECT`).
+  - Transporte HTTPS `executePinnedHttpsRequest` (`src/security/secure-http-transport.ts`) conectando o socket diretamente ao IP validado pelo DNS (`pinnedAddress`) com preservação de TLS SNI (`servername`) e bloqueio de redirecionamentos `3xx`.
+- **Sincronização Incremental dos 9 Domínios & Métricas Agregadas Exatas**:
+  - `PersistentPostgresAdsSyncEngine` gravando idempotentemente nas 9 tabelas (`ad_accounts`, `campaigns`, `ad_groups`, `ads`, `keywords`, `search_terms`, `conversions`, `daily_metrics`, `budgets`) com lock durável em `sync_runs` e recuperação de jobs órfãos (`recoverStaleRunningSyncs`).
+  - Cálculo de métricas agregadas (`CTR`, `CPA`, `CPC`, `ROAS`) estritamente sobre as somas totais do período selecionado.
+- **Qualidade & Acessibilidade**:
+  - 45 testes aprovados no Vitest e 8 testes E2E no Playwright incluindo auditoria automatizada WCAG 2.1 A/AA com `@axe-core/playwright`.
+
 ## [0.2.0] - 2026-11-26 — Stage 2.0: Authentication, Multi-Tenancy & Google Ads Read-Only
 
 ### Adicionado

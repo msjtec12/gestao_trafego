@@ -30,6 +30,9 @@ yarn-error.log*
 .env.*
 !.env.example
 
+# Local persistent embedded PostgreSQL directory for dev/E2E
+.data/
+
 # Vercel
 .vercel
 

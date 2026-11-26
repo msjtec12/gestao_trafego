@@ -49,10 +49,18 @@ describe("PostgreSQL Real Disposable DB Integration — RLS, Composite FKs, Tabl
       ),
       "utf8"
     );
+    const migration0003 = fs.readFileSync(
+      path.resolve(
+        process.cwd(),
+        "drizzle/migrations/0003_stage2_1_operational_persistence.sql"
+      ),
+      "utf8"
+    );
 
     await pg.exec(migration0000);
     await pg.exec(migration0001);
     await pg.exec(migration0002);
+    await pg.exec(migration0003);
 
     await pg.exec(`
       INSERT INTO organizations (id, name, slug) VALUES

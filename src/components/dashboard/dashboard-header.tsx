@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Menu, Moon, Search, ShieldCheck, Sun } from "lucide-react";
+import { LogOut, Menu, Moon, Search, ShieldCheck, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
+import { logoutUserAction } from "@/app/actions/operational-actions";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { EmergencyStopControl } from "./emergency-stop-control";
 
 export interface DashboardHeaderProps {
@@ -11,6 +13,7 @@ export interface DashboardHeaderProps {
   readonly onOpenCommandPalette: () => void;
   readonly emergencyStopActive: boolean;
   readonly onToggleEmergencyStop: () => void;
+  readonly authenticatedUserEmail?: string;
 }
 
 export function DashboardHeader({
@@ -18,6 +21,7 @@ export function DashboardHeader({
   onOpenCommandPalette,
   emergencyStopActive,
   onToggleEmergencyStop,
+  authenticatedUserEmail,
 }: DashboardHeaderProps) {
   const { resolvedTheme, setTheme } = useTheme();
   const [mounted, setMounted] = React.useState(false);
@@ -25,6 +29,11 @@ export function DashboardHeader({
   React.useEffect(() => {
     setMounted(true);
   }, []);
+
+  const handleLogout = async () => {
+    await logoutUserAction();
+    window.location.assign("/login");
+  };
 
   return (
     <header className="sticky top-0 z-30 min-h-16 border-b border-slate-200 dark:border-slate-800/90 bg-white/95 dark:bg-[#081121]/95 backdrop-blur-md px-3 sm:px-4 lg:px-8 py-2 flex flex-wrap items-center justify-between gap-2">
@@ -67,6 +76,20 @@ export function DashboardHeader({
           emergencyStopActive={emergencyStopActive}
           onToggle={onToggleEmergencyStop}
         />
+
+        {authenticatedUserEmail && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleLogout}
+            data-testid="logout-btn"
+            aria-label={`Sair da sessão (${authenticatedUserEmail})`}
+          >
+            <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">Sair</span>
+          </Button>
+        )}
 
         {mounted && (
           <button

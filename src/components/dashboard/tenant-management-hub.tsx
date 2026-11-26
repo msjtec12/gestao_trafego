@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { z } from "zod";
+import { useRouter } from "next/navigation";
 import {
   Building2,
   Users,
@@ -14,15 +14,27 @@ import {
   RefreshCw,
   Ban,
   Lock,
+  Pencil,
+  Trash2,
+  ExternalLink,
 } from "lucide-react";
 import type {
   AdAccountRecordViewModel,
+  AuditEventViewModel,
   ClientRecordViewModel,
   IntegrationHealthViewModel,
   MemberRecordViewModel,
   OrganizationOption,
+  SyncRunViewModel,
 } from "@/application/use-cases/dashboard-overview-use-case";
-import { toPublicSafeErrorMessage } from "@/security/public-errors";
+import {
+  createClientServerAction,
+  deactivateClientServerAction,
+  requestSyncServerAction,
+  revokeIntegrationServerAction,
+  toggleAdAccountSelectionServerAction,
+  updateClientServerAction,
+} from "@/app/actions/operational-actions";
 import { formatCurrencyBrl } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,38 +46,14 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 
-const CreateClientFormSchema = z.object({
-  name: z
-    .string()
-    .min(3, "O nome do cliente deve ter pelo menos 3 caracteres.")
-    .max(160),
-  industry: z
-    .string()
-    .min(3, "Informe o segmento/nicho com pelo menos 3 caracteres.")
-    .max(100),
-  monthlyBudgetCapBrl: z.coerce
-    .number()
-    .refine((n) => Number.isFinite(n) && n > 0, {
-      message: "O teto mensal de verba deve ser um valor positivo.",
-    }),
-  targetCpaBrl: z.coerce
-    .number()
-    .refine((n) => Number.isFinite(n) && n > 0, {
-      message: "A meta de CPA deve ser um número positivo.",
-    }),
-});
-
 export interface TenantManagementHubProps {
   readonly activeOrganization: OrganizationOption;
   readonly clients: readonly ClientRecordViewModel[];
   readonly adAccounts: readonly AdAccountRecordViewModel[];
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
-  readonly onClientCreated: (newClient: ClientRecordViewModel) => void;
-  readonly onToggleAccountSelection: (accountId: string) => void;
-  readonly onRevokeIntegration: (integrationId: string) => void;
-  readonly onTriggerIncrementalSync: () => void;
-  readonly isSyncing: boolean;
+  readonly syncHistory?: readonly SyncRunViewModel[];
+  readonly auditTrail?: readonly AuditEventViewModel[];
 }
 
 type ManagementTab =
@@ -81,79 +69,157 @@ export function TenantManagementHub({
   adAccounts,
   members,
   integrations,
-  onClientCreated,
-  onToggleAccountSelection,
-  onRevokeIntegration,
-  onTriggerIncrementalSync,
-  isSyncing,
+  syncHistory = [],
+  auditTrail = [],
 }: TenantManagementHubProps) {
+  const router = useRouter();
   const [activeTab, setActiveTab] = React.useState<ManagementTab>("clients");
   const [clientName, setClientName] = React.useState("");
   const [clientIndustry, setClientIndustry] = React.useState("");
   const [monthlyBudgetBrl, setMonthlyBudgetBrl] = React.useState("5000");
   const [targetCpaBrl, setTargetCpaBrl] = React.useState("45");
+
+  const [editingClientId, setEditingClientId] = React.useState<string | null>(
+    null
+  );
+  const [editName, setEditName] = React.useState("");
+  const [editIndustry, setEditIndustry] = React.useState("");
+  const [editBudgetBrl, setEditBudgetBrl] = React.useState("");
+
   const [formError, setFormError] = React.useState<string | null>(null);
-  const [auditEvents, setAuditEvents] = React.useState<
-    readonly { id: string; timestamp: string; action: string; detail: string }[]
-  >([
-    {
-      id: "aud-init-1",
-      timestamp: "2026-11-26 10:15:00",
-      action: "RLS_SESSION_VERIFIED",
-      detail: `Contexto multi-tenant ativo para ${activeOrganization.name} (${activeOrganization.id}) em modo READ_ONLY.`,
-    },
-  ]);
+  const [statusBanner, setStatusBanner] = React.useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = React.useState(false);
 
-  const appendAudit = React.useCallback((action: string, detail: string) => {
-    setAuditEvents((prev) => [
-      {
-        id: `aud-${Date.now()}`,
-        timestamp: new Date().toISOString().slice(0, 19).replace("T", " "),
-        action,
-        detail,
-      },
-      ...prev,
-    ]);
-  }, []);
-
-  const handleCreateClient = (e: React.FormEvent) => {
+  const handleCreateClient = async (e: React.FormEvent) => {
     e.preventDefault();
     setFormError(null);
+    setStatusBanner(null);
 
-    const parsed = CreateClientFormSchema.safeParse({
-      name: clientName,
-      industry: clientIndustry,
-      monthlyBudgetCapBrl: monthlyBudgetBrl,
-      targetCpaBrl,
-    });
-
-    if (!parsed.success) {
-      const firstIssue = parsed.error.issues[0]?.message ?? "Dados inválidos.";
-      setFormError(firstIssue);
+    if (activeOrganization.isDemo) {
+      setFormError(
+        "O ambiente demonstrativo público (/demo) é somente leitura. Faça login em /login para persistir clientes no PostgreSQL."
+      );
       return;
     }
 
+    setIsSubmitting(true);
     try {
-      const created: ClientRecordViewModel = {
-        id: `client-${Date.now()}`,
-        organizationId: activeOrganization.id,
-        name: parsed.data.name.trim(),
-        industry: parsed.data.industry.trim(),
-        monthlyBudgetCapBrl: parsed.data.monthlyBudgetCapBrl,
-        targetCpaBrl: parsed.data.targetCpaBrl,
-        targetRoas: 5.0,
-        isActive: true,
-        isDemoData: activeOrganization.isDemo,
-      };
-      onClientCreated(created);
-      appendAudit(
-        "CLIENT_CREATED",
-        `Cliente '${created.name}' (${created.industry}) cadastrado com teto mensal ${formatCurrencyBrl(created.monthlyBudgetCapBrl)}.`
-      );
+      const res = await createClientServerAction({
+        name: clientName,
+        industry: clientIndustry,
+        monthlyBudgetCapBrl: monthlyBudgetBrl,
+        targetCpaBrl,
+      });
+
+      if (!res.ok) {
+        setFormError(res.error ?? "Erro ao cadastrar cliente.");
+        return;
+      }
+
       setClientName("");
       setClientIndustry("");
-    } catch (err) {
-      setFormError(toPublicSafeErrorMessage(err).publicMessage);
+      setStatusBanner("Cliente persistido e auditado no PostgreSQL com sucesso.");
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleSaveEditClient = async (clientId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await updateClientServerAction({
+        clientId,
+        name: editName,
+        industry: editIndustry,
+        monthlyBudgetCapBrl: editBudgetBrl,
+        targetCpaBrl: 45,
+      });
+
+      if (!res.ok) {
+        setFormError(res.error ?? "Erro ao atualizar cliente.");
+        return;
+      }
+
+      setEditingClientId(null);
+      setStatusBanner("Cliente atualizado no PostgreSQL com sucesso.");
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleDeactivateClient = async (clientId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await deactivateClientServerAction(clientId);
+      if (!res.ok) {
+        setFormError(res.error ?? "Erro ao inativar cliente.");
+        return;
+      }
+      setStatusBanner("Cliente inativado e registrado em audit_logs.");
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleToggleAccount = async (accountId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await toggleAdAccountSelectionServerAction(accountId);
+      if (!res.ok) {
+        setFormError(res.error ?? "Erro ao atualizar conta.");
+        return;
+      }
+      setStatusBanner("Seleção de conta persistida no PostgreSQL.");
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleRevokeIntegration = async (integrationId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await revokeIntegrationServerAction(integrationId);
+      if (!res.ok) {
+        setFormError(res.error ?? "Erro ao revogar integração.");
+        return;
+      }
+      setStatusBanner(
+        "Credenciais revogadas e removidas do Credential Vault no PostgreSQL."
+      );
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleTriggerSync = async (integrationId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await requestSyncServerAction(integrationId);
+      if (!res.ok) {
+        setFormError(res.error ?? "Falha ao executar sincronização.");
+        return;
+      }
+      setStatusBanner(
+        "Sincronização concluída e persistida nos 9 domínios do PostgreSQL."
+      );
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -177,7 +243,7 @@ export function TenantManagementHub({
     },
     {
       id: "integrations",
-      label: "Integrações & Google Ads OAuth",
+      label: "Integrações & Sincronizações",
       icon: PlugZap,
       count: integrations.length,
     },
@@ -205,47 +271,21 @@ export function TenantManagementHub({
                 aria-hidden="true"
               />
               <CardTitle className="text-base">
-                Central Multi-Tenant — Gestão de Clientes, Contas MCC,
-                Integrações & RBAC
+                Central Multi-Tenant — Gestão Persistente no PostgreSQL
               </CardTitle>
               <Badge variant={activeOrganization.isDemo ? "demo" : "default"}>
                 {activeOrganization.isDemo
                   ? "TENANT DEMONSTRATIVO"
-                  : "TENANT OPERACIONAL"}
+                  : "TENANT OPERACIONAL (POSTGRESQL)"}
               </Badge>
             </div>
             <CardDescription className="mt-1">
-              Operações isoladas por <code>organization_id</code> com validação
-              Zod, escopo <code>CLIENT_VIEWER</code> e trilha de auditoria
+              Todas as operações validam sessão no servidor, RBAC, Zod e
+              persistem com auditoria no PostgreSQL
             </CardDescription>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={isSyncing}
-              onClick={() => {
-                onTriggerIncrementalSync();
-                appendAudit(
-                  "INCREMENTAL_SYNC_TRIGGERED",
-                  "Sincronização incremental idempotente (somente leitura) executada com checkpoint atualizado."
-                );
-              }}
-            >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${isSyncing ? "animate-spin" : ""}`}
-                aria-hidden="true"
-              />
-              {isSyncing
-                ? "Sincronizando..."
-                : "Sincronizar Contas Selecionadas (Read-Only)"}
-            </Button>
           </div>
         </div>
 
-        {/* Accessible Navigation Tabs */}
         <div
           role="tablist"
           aria-label="Abas de Gestão Multi-Tenant"
@@ -281,6 +321,26 @@ export function TenantManagementHub({
       </CardHeader>
 
       <CardContent className="space-y-4">
+        {formError && (
+          <div
+            role="alert"
+            data-testid="management-error-alert"
+            className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-300"
+          >
+            {formError}
+          </div>
+        )}
+
+        {statusBanner && (
+          <div
+            role="status"
+            data-testid="management-success-status"
+            className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300"
+          >
+            {statusBanner}
+          </div>
+        )}
+
         {/* TAB 1: CLIENTS */}
         {activeTab === "clients" && (
           <div className="space-y-4">
@@ -290,25 +350,17 @@ export function TenantManagementHub({
             >
               <div className="flex items-center justify-between">
                 <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-300">
-                  Cadastrar Novo Cliente na Organização (Validação Zod)
+                  Cadastrar Novo Cliente (Persistente no PostgreSQL)
                 </h4>
                 <Badge variant="secondary">
                   org_id: {activeOrganization.id}
                 </Badge>
               </div>
 
-              {formError && (
-                <div
-                  role="alert"
-                  className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-300"
-                >
-                  {formError}
-                </div>
-              )}
-
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
                 <input
                   type="text"
+                  data-testid="create-client-name-input"
                   value={clientName}
                   onChange={(e) => setClientName(e.target.value)}
                   placeholder="Nome do Cliente (ex.: Clínica Vida)"
@@ -317,6 +369,7 @@ export function TenantManagementHub({
                 />
                 <input
                   type="text"
+                  data-testid="create-client-industry-input"
                   value={clientIndustry}
                   onChange={(e) => setClientIndustry(e.target.value)}
                   placeholder="Segmento (ex.: Odontologia)"
@@ -325,6 +378,7 @@ export function TenantManagementHub({
                 />
                 <input
                   type="number"
+                  data-testid="create-client-budget-input"
                   value={monthlyBudgetBrl}
                   onChange={(e) => setMonthlyBudgetBrl(e.target.value)}
                   placeholder="Teto Mensal (R$)"
@@ -333,13 +387,20 @@ export function TenantManagementHub({
                 />
                 <input
                   type="number"
+                  data-testid="create-client-cpa-input"
                   value={targetCpaBrl}
                   onChange={(e) => setTargetCpaBrl(e.target.value)}
                   placeholder="Meta CPA (R$)"
                   aria-label="Meta de CPA em reais"
                   className="h-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 text-xs"
                 />
-                <Button type="submit" size="sm" className="h-9">
+                <Button
+                  type="submit"
+                  size="sm"
+                  disabled={isSubmitting}
+                  data-testid="create-client-submit-btn"
+                  className="h-9"
+                >
                   <Plus className="h-3.5 w-3.5" aria-hidden="true" />
                   Adicionar Cliente
                 </Button>
@@ -347,47 +408,138 @@ export function TenantManagementHub({
             </form>
 
             {clients.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-800 py-10 text-center text-xs text-slate-500">
-                Nenhum cliente cadastrado para esta organização (Empty State).
+              <div
+                data-testid="clients-empty-state"
+                className="rounded-xl border border-dashed border-slate-300 dark:border-slate-800 py-10 text-center text-xs text-slate-500"
+              >
+                Nenhum cliente cadastrado para esta organização no PostgreSQL
+                (Empty State).
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {clients.map((client) => (
-                  <div
-                    key={client.id}
-                    className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 p-4 space-y-2 text-xs"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <span className="font-semibold text-slate-900 dark:text-slate-100 block">
-                          {client.name}
-                        </span>
-                        <span className="text-slate-500 dark:text-slate-400">
-                          {client.industry}
-                        </span>
-                      </div>
-                      <Badge variant={client.isDemoData ? "demo" : "success"}>
-                        {client.isDemoData ? "DEMO" : "ATIVO"}
-                      </Badge>
+                {clients.map((client) => {
+                  const isEditing = editingClientId === client.id;
+                  return (
+                    <div
+                      key={client.id}
+                      data-testid={`client-card-${client.id}`}
+                      className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 p-4 space-y-2 text-xs"
+                    >
+                      {isEditing ? (
+                        <div className="space-y-2">
+                          <input
+                            type="text"
+                            aria-label="Editar nome do cliente"
+                            value={editName}
+                            onChange={(e) => setEditName(e.target.value)}
+                            className="w-full h-8 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 text-xs"
+                          />
+                          <input
+                            type="text"
+                            aria-label="Editar segmento do cliente"
+                            value={editIndustry}
+                            onChange={(e) => setEditIndustry(e.target.value)}
+                            className="w-full h-8 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 text-xs"
+                          />
+                          <input
+                            type="number"
+                            aria-label="Editar teto mensal do cliente"
+                            value={editBudgetBrl}
+                            onChange={(e) => setEditBudgetBrl(e.target.value)}
+                            className="w-full h-8 rounded border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 text-xs"
+                          />
+                          <div className="flex items-center gap-2 pt-1">
+                            <Button
+                              type="button"
+                              size="sm"
+                              disabled={isSubmitting}
+                              onClick={() => handleSaveEditClient(client.id)}
+                            >
+                              Salvar
+                            </Button>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setEditingClientId(null)}
+                            >
+                              Cancelar
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <span className="font-semibold text-slate-900 dark:text-slate-100 block">
+                                {client.name}
+                              </span>
+                              <span className="text-slate-500 dark:text-slate-400">
+                                {client.industry}
+                              </span>
+                            </div>
+                            <Badge
+                              variant={client.isDemoData ? "demo" : "success"}
+                            >
+                              {client.isDemoData ? "DEMO" : "PERSISTIDO"}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
+                            <span>
+                              Teto Mensal:{" "}
+                              <strong>
+                                {formatCurrencyBrl(client.monthlyBudgetCapBrl)}
+                              </strong>
+                            </span>
+                            <span>
+                              Meta CPA:{" "}
+                              <strong>
+                                {client.targetCpaBrl
+                                  ? formatCurrencyBrl(client.targetCpaBrl)
+                                  : "N/D"}
+                              </strong>
+                            </span>
+                          </div>
+
+                          {!client.isDemoData && (
+                            <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200 dark:border-slate-800">
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                aria-label={`Editar cliente ${client.name}`}
+                                onClick={() => {
+                                  setEditingClientId(client.id);
+                                  setEditName(client.name);
+                                  setEditIndustry(client.industry);
+                                  setEditBudgetBrl(
+                                    String(client.monthlyBudgetCapBrl)
+                                  );
+                                }}
+                              >
+                                <Pencil className="h-3 w-3" aria-hidden="true" />
+                                Editar
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={isSubmitting}
+                                aria-label={`Inativar cliente ${client.name}`}
+                                onClick={() =>
+                                  handleDeactivateClient(client.id)
+                                }
+                              >
+                                <Trash2 className="h-3 w-3" aria-hidden="true" />
+                                Inativar
+                              </Button>
+                            </div>
+                          )}
+                        </>
+                      )}
                     </div>
-                    <div className="flex items-center justify-between pt-2 border-t border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300">
-                      <span>
-                        Teto Mensal:{" "}
-                        <strong>
-                          {formatCurrencyBrl(client.monthlyBudgetCapBrl)}
-                        </strong>
-                      </span>
-                      <span>
-                        Meta CPA:{" "}
-                        <strong>
-                          {client.targetCpaBrl
-                            ? formatCurrencyBrl(client.targetCpaBrl)
-                            : "N/D"}
-                        </strong>
-                      </span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -396,14 +548,9 @@ export function TenantManagementHub({
         {/* TAB 2: AD ACCOUNTS & MCC SELECTION */}
         {activeTab === "accounts" && (
           <div className="space-y-3">
-            <p className="text-xs text-slate-500 dark:text-slate-400">
-              Selecione quais contas vinculadas à MCC (
-              <code>login-customer-id: 990-100-2000</code>) estão autorizadas
-              para sincronização incremental somente leitura:
-            </p>
             {adAccounts.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-300 dark:border-slate-800 py-10 text-center text-xs text-slate-500">
-                Nenhuma conta de anúncios vinculada a esta organização.
+                Nenhuma conta de anúncios sincronizada para esta organização.
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -446,13 +593,8 @@ export function TenantManagementHub({
                         type="button"
                         variant="outline"
                         size="sm"
-                        onClick={() => {
-                          onToggleAccountSelection(acc.id);
-                          appendAudit(
-                            "AD_ACCOUNT_SYNC_TOGGLED",
-                            `Seleção de sincronização alterada para a conta ${acc.externalAccountId}.`
-                          );
-                        }}
+                        disabled={isSubmitting || activeOrganization.isDemo}
+                        onClick={() => handleToggleAccount(acc.id)}
                       >
                         {acc.isSelectedForSync
                           ? "Desmarcar da Sincronização"
@@ -466,86 +608,159 @@ export function TenantManagementHub({
           </div>
         )}
 
-        {/* TAB 3: INTEGRATIONS & GOOGLE ADS OAUTH 2.0 READ-ONLY */}
+        {/* TAB 3: INTEGRATIONS, GOOGLE ADS OAUTH & SYNC HISTORY */}
         {activeTab === "integrations" && (
-          <div className="space-y-3">
-            {integrations.map((intg) => (
-              <div
-                key={intg.id}
-                className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 p-4 space-y-3 text-xs"
-              >
-                <div className="flex flex-wrap items-start justify-between gap-2">
-                  <div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">
-                        {intg.label}
-                      </span>
-                      <Badge
-                        variant={
-                          intg.status === "CONNECTED"
-                            ? "success"
-                            : intg.status === "SANDBOX_DEMO"
-                              ? "demo"
-                              : intg.status === "REVOKED"
-                                ? "destructive"
-                                : "warning"
-                        }
-                      >
-                        {intg.status}
-                      </Badge>
-                      <Badge variant="default">
-                        <Lock className="h-3 w-3" aria-hidden="true" />
-                        {intg.mode}
-                      </Badge>
+          <div className="space-y-4">
+            <div className="space-y-3">
+              {integrations.map((intg) => (
+                <div
+                  key={intg.id}
+                  className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/60 p-4 space-y-3 text-xs"
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-semibold text-sm text-slate-900 dark:text-slate-100">
+                          {intg.label}
+                        </span>
+                        <Badge
+                          variant={
+                            intg.status === "CONNECTED"
+                              ? "success"
+                              : intg.status === "SANDBOX_DEMO"
+                                ? "demo"
+                                : intg.status === "REVOKED"
+                                  ? "destructive"
+                                  : "warning"
+                          }
+                        >
+                          {intg.status}
+                        </Badge>
+                        <Badge variant="default">
+                          <Lock className="h-3 w-3" aria-hidden="true" />
+                          {intg.mode}
+                        </Badge>
+                      </div>
+                      <p className="text-slate-600 dark:text-slate-300 mt-1">
+                        {intg.message}
+                      </p>
                     </div>
-                    <p className="text-slate-600 dark:text-slate-300 mt-1">
-                      {intg.message}
-                    </p>
-                  </div>
 
-                  <div className="flex items-center gap-2">
-                    {intg.status !== "REVOKED" && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      {intg.provider === "GOOGLE_ADS" &&
+                        !activeOrganization.isDemo && (
+                          <a
+                            href="/api/integrations/google-ads/authorize"
+                            className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-600 dark:text-cyan-300 hover:bg-cyan-500/20"
+                          >
+                            <ExternalLink
+                              className="h-3.5 w-3.5"
+                              aria-hidden="true"
+                            />
+                            Conectar OAuth 2.0 Google Ads
+                          </a>
+                        )}
+
                       <Button
                         type="button"
                         variant="outline"
                         size="sm"
-                        onClick={() => {
-                          onRevokeIntegration(intg.id);
-                          appendAudit(
-                            "INTEGRATION_REVOKED",
-                            `Credenciais da integração '${intg.label}' revogadas e removidas do Credential Vault.`
-                          );
-                        }}
+                        disabled={isSubmitting || activeOrganization.isDemo}
+                        onClick={() => handleTriggerSync(intg.id)}
                       >
-                        <Ban className="h-3.5 w-3.5" aria-hidden="true" />
-                        Revogar Credenciais
+                        <RefreshCw
+                          className={`h-3.5 w-3.5 ${
+                            isSubmitting ? "animate-spin" : ""
+                          }`}
+                          aria-hidden="true"
+                        />
+                        Solicitar Sincronização
                       </Button>
-                    )}
-                  </div>
-                </div>
 
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400">
-                  <div>
-                    Criptografia Vault:{" "}
-                    <strong className="text-slate-800 dark:text-slate-200">
-                      AES-256-GCM + AAD (orgId + integrationId)
-                    </strong>
+                      {intg.status !== "REVOKED" && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isSubmitting || activeOrganization.isDemo}
+                          onClick={() => handleRevokeIntegration(intg.id)}
+                        >
+                          <Ban className="h-3.5 w-3.5" aria-hidden="true" />
+                          Revogar Credenciais
+                        </Button>
+                      )}
+                    </div>
                   </div>
-                  <div>
-                    Última Sincronização:{" "}
-                    <strong className="text-slate-800 dark:text-slate-200">
-                      {intg.lastSyncedAtIso ?? "Nenhuma sincronização real"}
-                    </strong>
-                  </div>
-                  <div>
-                    Checkpoint Incremental:{" "}
-                    <code className="text-cyan-600 dark:text-cyan-400">
-                      {intg.lastCheckpoint ?? "N/D"}
-                    </code>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400">
+                    <div>
+                      Criptografia Vault:{" "}
+                      <strong className="text-slate-800 dark:text-slate-200">
+                        AES-256-GCM + AAD (orgId + integrationId)
+                      </strong>
+                    </div>
+                    <div>
+                      Última Sincronização:{" "}
+                      <strong className="text-slate-800 dark:text-slate-200">
+                        {intg.lastSyncedAtIso ?? "Nenhuma sincronização"}
+                      </strong>
+                    </div>
+                    <div>
+                      Checkpoint Incremental:{" "}
+                      <code className="text-cyan-600 dark:text-cyan-400">
+                        {intg.lastCheckpoint ?? "N/D"}
+                      </code>
+                    </div>
                   </div>
                 </div>
+              ))}
+            </div>
+
+            {/* Persistent Sync Runs History */}
+            <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2 text-xs">
+              <div className="flex items-center justify-between">
+                <h4 className="font-semibold text-sm">
+                  Histórico de Sincronizações Persistidas (<code>sync_runs</code>)
+                </h4>
+                <Badge variant="secondary">
+                  {syncHistory.length} execuções
+                </Badge>
               </div>
-            ))}
+              {syncHistory.length === 0 ? (
+                <p className="text-slate-500 py-4 text-center">
+                  Nenhuma sincronização registrada para esta organização.
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {syncHistory.map((sr) => (
+                    <div
+                      key={sr.id}
+                      className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5 flex flex-wrap items-center justify-between gap-2"
+                    >
+                      <div>
+                        <span className="font-semibold">{sr.provider}</span> •{" "}
+                        <Badge
+                          variant={
+                            sr.status === "COMPLETED"
+                              ? "success"
+                              : sr.status === "FAILED"
+                                ? "destructive"
+                                : "warning"
+                          }
+                        >
+                          {sr.status}
+                        </Badge>
+                      </div>
+                      <div className="text-[11px] text-slate-500">
+                        Checkpoint:{" "}
+                        <code>{sr.checkpointToken ?? "N/D"}</code> • Início:{" "}
+                        {sr.startedAtIso}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -602,7 +817,7 @@ export function TenantManagementHub({
           </div>
         )}
 
-        {/* TAB 5: SETTINGS & AUDIT TRAIL */}
+        {/* TAB 5: SETTINGS & PERSISTENT AUDIT TRAIL */}
         {activeTab === "settings" && (
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 text-xs">
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2">
@@ -642,25 +857,31 @@ export function TenantManagementHub({
             <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-4 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="font-semibold text-sm">
-                  Trilha de Auditoria Recente (Imutável)
+                  Trilha de Auditoria Persistida (<code>audit_logs</code>)
                 </span>
-                <Badge variant="secondary">{auditEvents.length} eventos</Badge>
+                <Badge variant="secondary">{auditTrail.length} eventos</Badge>
               </div>
               <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
-                {auditEvents.map((ev) => (
-                  <div
-                    key={ev.id}
-                    className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5"
-                  >
-                    <div className="flex items-center justify-between text-[11px] text-cyan-600 dark:text-cyan-400">
-                      <strong>{ev.action}</strong>
-                      <span>{ev.timestamp}</span>
+                {auditTrail.length === 0 ? (
+                  <p className="text-slate-500 py-4 text-center">
+                    Nenhum evento de auditoria registrado.
+                  </p>
+                ) : (
+                  auditTrail.map((ev) => (
+                    <div
+                      key={ev.id}
+                      className="rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-2.5"
+                    >
+                      <div className="flex items-center justify-between text-[11px] text-cyan-600 dark:text-cyan-400">
+                        <strong>{ev.action}</strong>
+                        <span>{ev.timestamp}</span>
+                      </div>
+                      <p className="text-slate-600 dark:text-slate-300 mt-0.5 truncate">
+                        {ev.entityType} ({ev.entityId}): {ev.detail}
+                      </p>
                     </div>
-                    <p className="text-slate-600 dark:text-slate-300 mt-0.5">
-                      {ev.detail}
-                    </p>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
             </div>
           </div>

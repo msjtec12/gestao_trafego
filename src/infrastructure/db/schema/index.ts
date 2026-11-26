@@ -163,6 +163,42 @@ export const users = pgTable(
 );
 
 // ============================================================================
+// 2B. USER SESSIONS (Persistent Server-Side Sessions)
+// ============================================================================
+
+export const userSessions = pgTable(
+  "user_sessions",
+  {
+    sessionToken: varchar("session_token", { length: 128 }).primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    activeOrganizationId: uuid("active_organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [index("user_sessions_user_idx").on(table.userId)]
+);
+
+// ============================================================================
+// 2C. AUTH RATE LIMITS (Durable Brute-Force Protection in PostgreSQL)
+// ============================================================================
+
+export const authRateLimits = pgTable("auth_rate_limits", {
+  identifier: varchar("identifier", { length: 255 }).primaryKey(),
+  attempts: integer("attempts").default(0).notNull(),
+  firstAttemptAt: timestamp("first_attempt_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
+});
+
+// ============================================================================
 // 3. MEMBERSHIPS (RBAC Multi-Tenant)
 // ============================================================================
 
@@ -294,6 +330,7 @@ export const integrations = pgTable(
     scopes: jsonb("scopes").$type<string[]>().default([]).notNull(),
     tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+    lastCheckpointToken: varchar("last_checkpoint_token", { length: 255 }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     isDemoIntegration: boolean("is_demo_integration").default(true).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
@@ -309,6 +346,34 @@ export const integrations = pgTable(
       table.organizationId,
       table.provider
     ),
+  ]
+);
+
+// ============================================================================
+// 5B. OAUTH STATES (Single-Use Persistent CSRF & PKCE State Store)
+// ============================================================================
+
+export const oauthStates = pgTable(
+  "oauth_states",
+  {
+    nonce: varchar("nonce", { length: 128 }).primaryKey(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    provider: adProviderEnum("provider").notNull(),
+    codeVerifier: varchar("code_verifier", { length: 255 }).notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("oauth_states_org_user_idx").on(table.organizationId, table.userId),
   ]
 );
 
@@ -445,6 +510,11 @@ export const adGroups = pgTable(
   },
   (table) => [
     uniqueIndex("ad_groups_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("ad_groups_org_camp_ext_idx").on(
+      table.organizationId,
+      table.campaignId,
+      table.externalAdGroupId
+    ),
     index("ad_groups_org_campaign_idx").on(
       table.organizationId,
       table.campaignId
@@ -487,6 +557,11 @@ export const ads = pgTable(
   },
   (table) => [
     uniqueIndex("ads_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("ads_org_adgroup_ext_idx").on(
+      table.organizationId,
+      table.adGroupId,
+      table.externalAdId
+    ),
     index("ads_org_adgroup_idx").on(table.organizationId, table.adGroupId),
     foreignKey({
       name: "ads_org_ad_group_fk",
@@ -526,6 +601,11 @@ export const keywords = pgTable(
   },
   (table) => [
     uniqueIndex("keywords_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("keywords_org_adgroup_ext_idx").on(
+      table.organizationId,
+      table.adGroupId,
+      table.externalKeywordId
+    ),
     index("keywords_org_adgroup_idx").on(table.organizationId, table.adGroupId),
     foreignKey({
       name: "keywords_org_ad_group_fk",
@@ -564,6 +644,12 @@ export const searchTerms = pgTable(
     uniqueIndex("search_terms_org_id_unique").on(
       table.organizationId,
       table.id
+    ),
+    uniqueIndex("search_terms_org_camp_term_date_idx").on(
+      table.organizationId,
+      table.campaignId,
+      table.searchTerm,
+      table.observedDate
     ),
     index("search_terms_org_campaign_idx").on(
       table.organizationId,
@@ -663,6 +749,11 @@ export const conversions = pgTable(
   },
   (table) => [
     uniqueIndex("conversions_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("conversions_org_acc_ext_idx").on(
+      table.organizationId,
+      table.adAccountId,
+      table.externalConversionId
+    ),
     index("conversions_org_account_idx").on(
       table.organizationId,
       table.adAccountId
@@ -688,7 +779,7 @@ export const budgets = pgTable(
       .references(() => organizations.id, { onDelete: "cascade" }),
     clientId: uuid("client_id").notNull(),
     campaignId: uuid("campaign_id"),
-    periodMonth: varchar("period_month", { length: 7 }).notNull(), // YYYY-MM
+    periodMonth: varchar("period_month", { length: 7 }).notNull(),
     allocatedCents: bigint("allocated_cents", { mode: "number" }).notNull(),
     spentCents: bigint("spent_cents", { mode: "number" }).default(0).notNull(),
     maxDailyHardLimitCents: bigint("max_daily_hard_limit_cents", {
@@ -704,6 +795,11 @@ export const budgets = pgTable(
   },
   (table) => [
     uniqueIndex("budgets_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("budgets_org_client_period_unique_idx").on(
+      table.organizationId,
+      table.clientId,
+      table.periodMonth
+    ),
     index("budgets_org_client_period_idx").on(
       table.organizationId,
       table.clientId,
@@ -1133,6 +1229,7 @@ export const TENANT_SCOPED_TABLES = [
   "member_client_access",
   "clients",
   "integrations",
+  "oauth_states",
   "ad_accounts",
   "campaigns",
   "ad_groups",

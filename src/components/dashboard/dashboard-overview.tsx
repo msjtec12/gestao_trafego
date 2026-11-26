@@ -14,10 +14,12 @@ import {
 } from "lucide-react";
 import type {
   AdAccountRecordViewModel,
+  AuditEventViewModel,
   ClientRecordViewModel,
   IntegrationHealthViewModel,
   MemberRecordViewModel,
   OrganizationOption,
+  SyncRunViewModel,
 } from "@/application/use-cases/dashboard-overview-use-case";
 import type {
   NormalizedCampaign,
@@ -51,16 +53,13 @@ export interface DashboardOverviewProps {
   readonly adAccounts: readonly AdAccountRecordViewModel[];
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
+  readonly syncHistory?: readonly SyncRunViewModel[];
+  readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
   readonly domainTables: readonly string[];
   readonly emergencyStopActive: boolean;
-  readonly onClientCreated: (newClient: ClientRecordViewModel) => void;
-  readonly onToggleAccountSelection: (accountId: string) => void;
-  readonly onRevokeIntegration: (integrationId: string) => void;
-  readonly onTriggerIncrementalSync: () => void;
-  readonly isSyncing: boolean;
   readonly lastSyncTimestamp: string | null;
 }
 
@@ -118,16 +117,13 @@ export function DashboardOverview({
   adAccounts,
   members,
   integrations,
+  syncHistory = [],
+  auditTrail = [],
   campaigns,
   dailyMetrics,
   recommendations,
   domainTables,
   emergencyStopActive,
-  onClientCreated,
-  onToggleAccountSelection,
-  onRevokeIntegration,
-  onTriggerIncrementalSync,
-  isSyncing,
   lastSyncTimestamp,
 }: DashboardOverviewProps) {
   const [selectedClientId, setSelectedClientId] = React.useState<string>("ALL");
@@ -136,19 +132,12 @@ export function DashboardOverview({
   const [periodWindowDays, setPeriodWindowDays] =
     React.useState<PeriodWindowDays>(7);
 
-  // Filter accounts based on selected client
   const availableAccounts = React.useMemo(() => {
     if (selectedClientId === "ALL") return adAccounts;
     return adAccounts.filter((a) => a.clientId === selectedClientId);
   }, [adAccounts, selectedClientId]);
 
-  // Filter campaigns by active organization, client, and account selection
   const scopedCampaigns = React.useMemo(() => {
-    if (!activeOrganization.isDemo) {
-      // Operational tenant without real Google Ads credentials has 0 synced campaigns (no fake data!)
-      return [];
-    }
-
     return campaigns.filter((c) => {
       if (selectedClientId !== "ALL" && c.clientId !== selectedClientId) {
         return false;
@@ -161,15 +150,9 @@ export function DashboardOverview({
       }
       return true;
     });
-  }, [
-    activeOrganization.isDemo,
-    campaigns,
-    selectedClientId,
-    selectedAccountId,
-    adAccounts,
-  ]);
+  }, [campaigns, selectedClientId, selectedAccountId, adAccounts]);
 
-  // Aggregate metrics for the selected time window (3d, 7d, 14d, 30d)
+  // Section 13 Invariant: Calculate CTR, CPC, CPA, and ROAS strictly over aggregated totals
   const aggregatedMetrics = React.useMemo(() => {
     if (scopedCampaigns.length === 0) {
       return {
@@ -198,7 +181,7 @@ export function DashboardOverview({
     let conversions = 0;
     let clicks = 0;
     let impressions = 0;
-    let weightedRoasNumerator = 0;
+    let totalConversionValueBrl = 0;
 
     for (const camp of scopedCampaigns) {
       const win = camp.metricsByWindowDays?.[periodWindowDays];
@@ -216,14 +199,13 @@ export function DashboardOverview({
       conversions += campConv;
       clicks += campClicks;
       impressions += campImpr;
-      weightedRoasNumerator += campRoas * campSpend;
+      totalConversionValueBrl += campRoas * campSpend;
     }
 
-    // Phase 7 requirement: differentiate zero vs unavailable metric (N/D) when denominator is 0
     const cpaBrl = conversions > 0 ? spendBrl / conversions : null;
     const cpcBrl = clicks > 0 ? spendBrl / clicks : null;
     const ctrPct = impressions > 0 ? (clicks / impressions) * 100 : null;
-    const roas = spendBrl > 0 ? weightedRoasNumerator / spendBrl : null;
+    const roas = spendBrl > 0 ? totalConversionValueBrl / spendBrl : null;
 
     return {
       hasData: true,
@@ -240,7 +222,6 @@ export function DashboardOverview({
 
   return (
     <main className="flex-1 p-3 sm:p-4 lg:p-8 space-y-6 lg:space-y-8 max-w-[1600px] w-full mx-auto">
-      {/* Operational Selectors Bar (Phase 7: Org, Client, AdAccount, Period, Last Sync & Health) */}
       <section
         aria-label="Filtros Operacionais Multi-Tenant"
         className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0b1629]/95 p-4 space-y-3 shadow-sm"
@@ -259,13 +240,12 @@ export function DashboardOverview({
               <Clock className="h-3.5 w-3.5 text-cyan-400" />
               Última Sincronização:{" "}
               <strong className="text-slate-800 dark:text-slate-200">
-                {activeOrganization.isDemo
-                  ? lastSyncTimestamp ?? "26/11/2026 10:15 (Sandbox Demo)"
-                  : "Sem sincronização (Credenciais Google Ads pendentes)"}
+                {lastSyncTimestamp ??
+                  "Sem sincronização registrada (Aguardando conexão OAuth)"}
               </strong>
             </span>
             <Badge
-              variant={activeOrganization.isDemo ? "demo" : "warning"}
+              variant={activeOrganization.isDemo ? "demo" : "default"}
               data-testid="environment-scope-badge"
             >
               {activeOrganization.isDemo
@@ -376,7 +356,6 @@ export function DashboardOverview({
         </div>
       </section>
 
-      {/* Section 1: Overview & Analytical KPI Cards (Differentiating Zero, No Data, and N/D) */}
       <section id="overview" className="space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
@@ -408,7 +387,6 @@ export function DashboardOverview({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
-          {/* KPI 1: Spend */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>
@@ -427,14 +405,15 @@ export function DashboardOverview({
               </div>
               <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
                 <span>{scopedCampaigns.length} campanhas</span>
-                <Badge variant={activeOrganization.isDemo ? "demo" : "secondary"}>
-                  {activeOrganization.isDemo ? "DEMO" : "REAL"}
+                <Badge
+                  variant={activeOrganization.isDemo ? "demo" : "secondary"}
+                >
+                  {activeOrganization.isDemo ? "DEMO" : "POSTGRESQL"}
                 </Badge>
               </div>
             </CardContent>
           </Card>
 
-          {/* KPI 2: Conversions */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>
@@ -461,7 +440,6 @@ export function DashboardOverview({
             </CardContent>
           </Card>
 
-          {/* KPI 3: CPA */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>CPA Médio ({periodWindowDays}d)</CardDescription>
@@ -484,7 +462,6 @@ export function DashboardOverview({
             </CardContent>
           </Card>
 
-          {/* KPI 4: CPC */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>CPC Médio ({periodWindowDays}d)</CardDescription>
@@ -507,7 +484,6 @@ export function DashboardOverview({
             </CardContent>
           </Card>
 
-          {/* KPI 5: CTR */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>CTR Médio ({periodWindowDays}d)</CardDescription>
@@ -534,7 +510,6 @@ export function DashboardOverview({
             </CardContent>
           </Card>
 
-          {/* KPI 6: ROAS */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
               <CardDescription>
@@ -561,11 +536,8 @@ export function DashboardOverview({
         </div>
       </section>
 
-      {/* Section 2: Interactive Chart + Automation Governance Summary */}
       <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
-        <PerformanceChart
-          metrics={activeOrganization.isDemo ? dailyMetrics : []}
-        />
+        <PerformanceChart metrics={dailyMetrics} />
 
         <Card id="automation-engine">
           <CardHeader>
@@ -575,7 +547,7 @@ export function DashboardOverview({
               </CardTitle>
               <Badge variant={emergencyStopActive ? "destructive" : "demo"}>
                 {emergencyStopActive
-                  ? "SUSPENSO (SIMULAÇÃO)"
+                  ? "SUSPENSO"
                   : "SANDBOX SUPERVISIONADO"}
               </Badge>
             </div>
@@ -623,7 +595,6 @@ export function DashboardOverview({
         </Card>
       </section>
 
-      {/* Section 3: Phase 4 Tenant Management Hub (Orgs, Members, Clients, Accounts, Integrations, Settings) */}
       <section>
         <TenantManagementHub
           activeOrganization={activeOrganization}
@@ -631,28 +602,22 @@ export function DashboardOverview({
           adAccounts={adAccounts}
           members={members}
           integrations={integrations}
-          onClientCreated={onClientCreated}
-          onToggleAccountSelection={onToggleAccountSelection}
-          onRevokeIntegration={onRevokeIntegration}
-          onTriggerIncrementalSync={onTriggerIncrementalSync}
-          isSyncing={isSyncing}
+          syncHistory={syncHistory}
+          auditTrail={auditTrail}
         />
       </section>
 
-      {/* Section 4: TanStack Table of Campaigns */}
       <section id="campaigns">
         <CampaignsTable campaigns={scopedCampaigns} />
       </section>
 
-      {/* Section 5: AI Supervised Recommendations */}
       <section id="ai-recommendations">
         <AIRecommendationsPanel
-          recommendations={activeOrganization.isDemo ? recommendations : []}
+          recommendations={recommendations}
           emergencyStopActive={emergencyStopActive}
         />
       </section>
 
-      {/* Section 6: Drizzle Domains & Provider Readiness Status */}
       <section id="architecture-docs">
         <Card>
           <CardHeader>

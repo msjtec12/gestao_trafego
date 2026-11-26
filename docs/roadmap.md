@@ -11,14 +11,13 @@
 
 ---
 
-## Fase 2 — Autenticação Real, Multi-Tenancy Persistente & Google Ads Read-Only (Concluída)
-- [x] Correções remanescentes da Fase 1: aprovação vinculada ao hash SHA-256 do payload (`actionPayloadHash`), FKs compostas nos relacionamentos opcionais, privilégios PostgreSQL restritos por tabela e sanitização de erros públicos.
-- [x] Autenticação com Auth.js v5 (`5.0.0-beta.32`), rate limiting contra abuso, validação autoritativa de sessão/role no servidor e onboarding seguro da primeira organização em `READ_ONLY`.
-- [x] Repositórios Drizzle persistentes (`PersistentDrizzleTenantRepository`) e tabela `member_client_access` garantindo isolamento para `CLIENT_VIEWER`.
-- [x] Central Multi-Tenant responsiva para gestão de Organizações, Membros, Clientes, Contas MCC, Integrações e Configurações.
-- [x] `GoogleAdsReadOnlyIntegrationService` (OAuth 2.0 PKCE + HMAC state, Credential Vault AES-256-GCM com AAD obrigatório, suporte a MCC, seleção de contas, revogação e GAQL estritamente `SELECT`).
-- [x] `IncrementalAdsSyncEngine` para os 9 domínios com lock de concorrência, checkpoints e conversão exata de `cost_micros`.
-- [x] Dashboard Operacional com seletores de Organização, Cliente, Conta e Período, diferenciação entre zero/`Sem dados`/`N/D` e Logo Oficial Konnexy Ads.
+## Fase 2 & 2.1 — Autenticação Operacional, Multi-Tenancy Persistente & Google Ads Read-Only (Concluída)
+- [x] Correções remanescentes da Fase 1: aprovação vinculada ao hash SHA-256 do payload (`actionPayloadHash`), FKs compostas nos relacionamentos opcionais, privilégios PostgreSQL restritos por tabela e sanitização de erros públicos (`src/security/public-errors.ts`).
+- [x] Autenticação operacional persistida no PostgreSQL (`/login`, `/onboarding`, logout com revogação em `user_sessions`, rate limiting durável em `auth_rate_limits`, proteção de rotas via `src/middleware.ts` e separação de `/demo`).
+- [x] Repositórios Drizzle persistentes (`PersistentDrizzleTenantRepository`) com operações reais para Organizações, Membros, `member_client_access` (`CLIENT_VIEWER`), Clientes (criar/editar/desativar), Integrações, Contas de Anúncios, Campanhas, Métricas Diárias, Sync Runs e Audit Logs.
+- [x] `PersistentPostgresGoogleAdsService` (OAuth 2.0 PKCE + `oauth_states` single-use no PostgreSQL, Route Handlers `/api/integrations/google-ads/authorize` e `callback`, Credential Vault AES-256-GCM com AAD e rotação de chaves `v1` → `v2`, revogação persistente e consultas REST Google Ads API `v26`).
+- [x] Transporte HTTPS `executePinnedHttpsRequest` com IP pinning real no socket (`node:https` + TLS SNI `servername`) e bloqueio de redirects `3xx`.
+- [x] `PersistentPostgresAdsSyncEngine` sincronizando idempotentemente os 9 domínios no PostgreSQL com lock durável em `sync_runs`, recuperação de jobs órfãos e cálculo exato de métricas agregadas sobre os totais do período.
 
 ---
 
