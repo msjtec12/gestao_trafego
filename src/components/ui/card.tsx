@@ -49,7 +49,7 @@ export function CardDescription({
 }: React.HTMLAttributes<HTMLParagraphElement>) {
   return (
     <p
-      className={cn("text-xs text-slate-500 dark:text-slate-400", className)}
+      className={cn("text-xs text-slate-600 dark:text-slate-300", className)}
       {...props}
     />
   );

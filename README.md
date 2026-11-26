@@ -62,6 +62,7 @@ Documentação detalhada disponível em [`docs/`](./docs/):
 - [Relatório de Hardening Foundation 1.1 (`docs/reviews/foundation-1.1-hardening-report.md`)](./docs/reviews/foundation-1.1-hardening-report.md)
 - [Relatório Etapa 2.0 — Auth, Multi-Tenancy & Google Ads Read-Only (`docs/reviews/stage-2-auth-multitenancy-google-ads-report.md`)](./docs/reviews/stage-2-auth-multitenancy-google-ads-report.md)
 - [Relatório Etapa 2.1 — Operational Completion (`docs/reviews/stage-2.1-operational-completion-report.md`)](./docs/reviews/stage-2.1-operational-completion-report.md)
+- [Relatório Etapa 2.2 — Production Readiness Hardening (`docs/reviews/stage-2.2-production-readiness-report.md`)](./docs/reviews/stage-2.2-production-readiness-report.md)
 - [ADRs (`docs/adr/`)](./docs/adr/)
 
 ---

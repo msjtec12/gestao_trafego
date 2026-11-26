@@ -1,6 +1,7 @@
 import { NextResponse, type NextRequest } from "next/server";
 
-export const SESSION_COOKIE_NAME = "konnexy_session";
+export const AUTHJS_SESSION_COOKIE_NAME = "authjs.session-token";
+export const SESSION_COOKIE_NAME = AUTHJS_SESSION_COOKIE_NAME;
 
 const PUBLIC_PAGE_PATHS = new Set<string>(["/login", "/onboarding", "/demo"]);
 
@@ -22,14 +23,16 @@ export function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  const sessionToken = request.cookies.get(SESSION_COOKIE_NAME)?.value?.trim();
+  const sessionToken =
+    request.cookies.get(AUTHJS_SESSION_COOKIE_NAME)?.value?.trim() ??
+    request.cookies.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value?.trim();
 
   if (!sessionToken) {
     if (pathname.startsWith("/api/")) {
       return NextResponse.json(
         {
           errorCode: "UNAUTHENTICATED_ACCESS",
-          publicMessage: "Autenticação obrigatória para acessar este endpoint.",
+          publicMessage: "Autenticação Auth.js obrigatória para acessar este endpoint.",
         },
         { status: 401 }
       );

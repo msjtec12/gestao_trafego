@@ -1,14 +1,49 @@
 import fs from "fs";
 import path from "path";
 import { neon, Pool } from "@neondatabase/serverless";
-import { drizzle as drizzleHttp } from "drizzle-orm/neon-http";
-import { drizzle as drizzleServerless } from "drizzle-orm/neon-serverless";
-import { drizzle as drizzlePglite, type PgliteDatabase } from "drizzle-orm/pglite";
+import { drizzle as drizzleHttp, type NeonHttpDatabase } from "drizzle-orm/neon-http";
+import {
+  drizzle as drizzleServerless,
+  type NeonDatabase,
+} from "drizzle-orm/neon-serverless";
+import {
+  drizzle as drizzlePglite,
+  type PgliteDatabase,
+} from "drizzle-orm/pglite";
 import { PGlite } from "@electric-sql/pglite";
 import { sql } from "drizzle-orm";
 import type { TenantContext } from "@/domain/types";
 import { UnauthenticatedAccessError } from "@/security/session-guard";
 import * as schema from "./schema";
+
+export type SchemaType = typeof schema;
+
+/**
+ * Strongly typed Drizzle PostgreSQL executor compatible with both the official
+ * Neon serverless driver (`NeonDatabase` / `NeonHttpDatabase`), `PgliteDatabase` (in explicit
+ * test/dev mode), and PostgreSQL transaction handles (`PgTransaction`).
+ * Eliminates all `any` types and `eslint-disable` directives across repositories and transactions.
+ */
+export type DrizzleQueryExecutor = Pick<
+  NeonDatabase<SchemaType>,
+  "select" | "insert" | "update" | "delete" | "execute"
+>;
+
+export type OperationalDrizzleDb =
+  | NeonDatabase<SchemaType>
+  | NeonHttpDatabase<SchemaType>
+  | PgliteDatabase<SchemaType>
+  | DrizzleQueryExecutor;
+
+export class DatabaseConfigurationError extends Error {
+  public readonly code = "DATABASE_CONFIGURATION_ERROR";
+  public readonly statusCode = 503;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "DatabaseConfigurationError";
+  }
+}
 
 const UUID_V4_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -34,32 +69,87 @@ export function assertAuthenticatedDbContext(
 }
 
 export function isLiveNeonConnectionConfigured(url?: string): boolean {
-  const target = url ?? process.env.DATABASE_URL ?? "";
+  const target = (url ?? process.env.DATABASE_URL ?? "").trim();
   if (!target.startsWith("postgresql://") && !target.startsWith("postgres://")) {
     return false;
   }
   if (
     target.includes("replace_with_password") ||
-    target.includes("localhost:5432/konnexy_ads")
+    target.includes("localhost:5432/konnexy_ads") ||
+    target.includes("ep-example")
   ) {
     return false;
   }
   return true;
 }
 
-export function createDbClient(connectionString?: string) {
-  const url = connectionString ?? process.env.DATABASE_URL;
-  if (!url) {
-    throw new Error(
-      "DATABASE_URL is not configured. Copy .env.example to .env.local and configure Neon PostgreSQL."
+/**
+ * Checks whether local/test PGlite is explicitly permitted.
+ * INVARIANT (Stage 2.2 P0):
+ * - In Vercel or cloud production (`VERCEL === "1"` or `NODE_ENV === "production"` without explicit
+ *   local E2E flag `KONNEXY_ALLOW_PGLITE_DEV === "true"`), PGlite is NEVER allowed.
+ * - On Vercel (`VERCEL === "1"`), PGlite is unconditionally forbidden even if `KONNEXY_ALLOW_PGLITE_DEV` is set.
+ */
+export function isExplicitPgliteTestOrDevAllowed(
+  rawEnv: Record<string, string | undefined> = process.env
+): boolean {
+  if (rawEnv.VERCEL === "1" || Boolean(rawEnv.VERCEL_ENV)) {
+    return false;
+  }
+  if (rawEnv.KONNEXY_ALLOW_PGLITE_DEV === "true") {
+    return true;
+  }
+  if (rawEnv.NODE_ENV === "test") {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Validates `DATABASE_URL` before any database operation starts.
+ * Fails closed with `DatabaseConfigurationError` if Neon is required and not configured.
+ */
+export function validateRequiredDatabaseUrl(options?: {
+  readonly connectionString?: string;
+  readonly allowExplicitPglite?: boolean;
+}): {
+  readonly mode: "NEON" | "PGLITE_DEV_TEST";
+  readonly connectionString: string | null;
+} {
+  const url = (options?.connectionString ?? process.env.DATABASE_URL ?? "").trim();
+
+  if (isLiveNeonConnectionConfigured(url)) {
+    return { mode: "NEON", connectionString: url };
+  }
+
+  const canUsePglite =
+    (options?.allowExplicitPglite ?? true) &&
+    isExplicitPgliteTestOrDevAllowed(process.env);
+
+  if (canUsePglite) {
+    return { mode: "PGLITE_DEV_TEST", connectionString: null };
+  }
+
+  throw new DatabaseConfigurationError(
+    "Neon PostgreSQL (DATABASE_URL) é obrigatório em produção e não está configurado ou contém credenciais de placeholder. Nenhum fallback silencioso para PGlite é permitido."
+  );
+}
+
+export function createDbClient(connectionString?: string): NeonHttpDatabase<SchemaType> {
+  const validated = validateRequiredDatabaseUrl({
+    connectionString,
+    allowExplicitPglite: false,
+  });
+  if (!validated.connectionString) {
+    throw new DatabaseConfigurationError(
+      "DATABASE_URL is not configured for Neon HTTP client."
     );
   }
-  const client = neon(url);
+  const client = neon(validated.connectionString);
   return drizzleHttp(client, { schema });
 }
 
 export type DatabaseClient = ReturnType<typeof createDbClient>;
-export type OperationalDrizzleDb = PgliteDatabase<typeof schema>;
 
 const MIGRATION_FILES = [
   "0000_confused_galactus.sql",
@@ -99,68 +189,100 @@ export async function applyAllMigrationsToPglite(pg: PGlite): Promise<void> {
   }
 }
 
+/**
+ * Applies all SQL migrations to a live Neon PostgreSQL database using a Pool connection.
+ * Used exclusively by authorized disposable Neon integration test suites or migration runners.
+ */
+export async function applyAllMigrationsToNeonPool(pool: Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS "_konnexy_migrations" (
+      "filename" varchar(255) PRIMARY KEY NOT NULL,
+      "applied_at" timestamp with time zone DEFAULT now() NOT NULL
+    );
+  `);
+
+  for (const filename of MIGRATION_FILES) {
+    const check = await pool.query<{ filename: string }>(
+      `SELECT filename FROM "_konnexy_migrations" WHERE filename = $1`,
+      [filename]
+    );
+    if (check.rows.length > 0) {
+      continue;
+    }
+
+    const fullPath = path.resolve(
+      process.cwd(),
+      "drizzle/migrations",
+      filename
+    );
+    const sqlContent = fs.readFileSync(fullPath, "utf8");
+    await pool.query(sqlContent);
+    await pool.query(
+      `INSERT INTO "_konnexy_migrations" (filename) VALUES ($1)`,
+      [filename]
+    );
+  }
+}
+
 declare global {
-  var __konnexyPersistentPgInstance: PGlite | undefined;
-  var __konnexyPersistentPgPromise:
-    | Promise<{ pg: PGlite; db: OperationalDrizzleDb }>
+  var __konnexyTestDevPgInstance: PGlite | undefined;
+  var __konnexyTestDevPgPromise:
+    | Promise<{ pg: PGlite; db: PgliteDatabase<SchemaType> }>
     | undefined;
 }
 
-/**
- * Returns the persistent PostgreSQL instance.
- * - When `KONNEXY_PG_DATA_DIR` or default `.data/konnexy-pgdata` is used in local/E2E,
- *   all tables, migrations, users, clients, integrations, and sync runs persist on disk across
- *   server restarts and page reloads.
- */
-export async function getOperationalPostgresRuntime(
+async function getExplicitTestOrDevPglite(
   customDataDir?: string
 ): Promise<{
   readonly pg: PGlite;
-  readonly db: OperationalDrizzleDb;
+  readonly db: PgliteDatabase<SchemaType>;
 }> {
-  if (globalThis.__konnexyPersistentPgPromise && !customDataDir) {
-    return await globalThis.__konnexyPersistentPgPromise;
+  if (!isExplicitPgliteTestOrDevAllowed(process.env)) {
+    throw new DatabaseConfigurationError(
+      "PGlite is strictly forbidden outside explicit test/dev environments."
+    );
+  }
+
+  if (globalThis.__konnexyTestDevPgPromise && !customDataDir) {
+    return await globalThis.__konnexyTestDevPgPromise;
   }
 
   const initPromise = (async () => {
     const dataDir =
       customDataDir ??
       process.env.KONNEXY_PG_DATA_DIR ??
-      path.resolve(process.cwd(), ".data/konnexy-pgdata");
+      "memory://";
 
     if (dataDir !== "memory://") {
       fs.mkdirSync(dataDir, { recursive: true });
     }
 
-    const pg =
-      dataDir === "memory://" ? new PGlite() : new PGlite(dataDir);
+    const pg = dataDir === "memory://" ? new PGlite() : new PGlite(dataDir);
     await applyAllMigrationsToPglite(pg);
     const db = drizzlePglite(pg, { schema });
-    globalThis.__konnexyPersistentPgInstance = pg;
+    globalThis.__konnexyTestDevPgInstance = pg;
     return { pg, db };
   })();
 
   if (!customDataDir) {
-    globalThis.__konnexyPersistentPgPromise = initPromise;
+    globalThis.__konnexyTestDevPgPromise = initPromise;
   }
 
   return await initPromise;
 }
 
 /**
- * Executes a callback inside an explicit PostgreSQL transaction protected by an
- * authenticated TenantContext (`SET LOCAL ROLE konnexy_app` +
- * `SELECT set_config('app.current_organization_id', context.organizationId, true)`).
+ * Executes an administrative database operation (Authentication lookup, Onboarding,
+ * Session resolution/revocation, or OAuth state pre-check) before or during TenantContext resolution.
  *
- * Uses the Neon serverless Pool driver when a live Neon connection string is provided,
- * or the persistent operational PostgreSQL engine in local/test environments.
+ * - In Production / Live Neon: connects via official Neon Serverless `Pool` (`DATABASE_ADMIN_URL` or `DATABASE_URL`)
+ *   and cleanly closes the pool in `finally`.
+ * - In Explicit Test / Dev (`NODE_ENV=test` or `KONNEXY_ALLOW_PGLITE_DEV=true`): runs against the
+ *   explicit test/dev PGlite instance.
+ * - Never falls back to PGlite in production.
  */
-export async function withTenantTransaction<T>(
-  contextOrOrgId: TenantContext | string,
-  callback: (
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    tx: any
-  ) => Promise<T>,
+export async function withAdminPostgresConnection<T>(
+  callback: (db: DrizzleQueryExecutor) => Promise<T>,
   options?: {
     readonly connectionString?: string;
     readonly customPg?: PGlite;
@@ -168,24 +290,105 @@ export async function withTenantTransaction<T>(
     readonly neonPoolFactory?: (connStr: string) => Pool;
   }
 ): Promise<T> {
-  const organizationId =
-    typeof contextOrOrgId === "string"
-      ? contextOrOrgId
-      : assertAuthenticatedDbContext(contextOrOrgId).organizationId;
+  if (options?.customPg) {
+    if (!isExplicitPgliteTestOrDevAllowed(process.env)) {
+      throw new DatabaseConfigurationError(
+        "customPg is not allowed in production."
+      );
+    }
+    const db = drizzlePglite(options.customPg, { schema }) as unknown as DrizzleQueryExecutor;
+    return await callback(db);
+  }
 
-  assertValidOrganizationUuid(organizationId);
-  const url = options?.connectionString ?? process.env.DATABASE_URL;
+  const adminUrl =
+    options?.connectionString ??
+    process.env.DATABASE_ADMIN_URL ??
+    process.env.DATABASE_URL;
 
-  if (
-    options?.forceNeonDriver ||
-    (!options?.customPg && isLiveNeonConnectionConfigured(url))
-  ) {
-    if (!url) {
-      throw new Error("DATABASE_URL is required for Neon transaction.");
+  const validated = validateRequiredDatabaseUrl({
+    connectionString: adminUrl,
+    allowExplicitPglite: !options?.forceNeonDriver,
+  });
+
+  if (options?.forceNeonDriver || validated.mode === "NEON") {
+    const connStr = validated.connectionString ?? adminUrl ?? "";
+    if (!connStr) {
+      throw new DatabaseConfigurationError(
+        "DATABASE_URL is required for Neon administrative connection."
+      );
     }
     const pool = options?.neonPoolFactory
-      ? options.neonPoolFactory(url)
-      : new Pool({ connectionString: url });
+      ? options.neonPoolFactory(connStr)
+      : new Pool({ connectionString: connStr });
+    const db = drizzleServerless(pool, { schema });
+
+    try {
+      return await callback(db);
+    } finally {
+      await pool.end();
+    }
+  }
+
+  const runtime = await getExplicitTestOrDevPglite();
+  return await callback(runtime.db as unknown as DrizzleQueryExecutor);
+}
+
+/**
+ * Executes an operational tenant-scoped database callback inside an explicit PostgreSQL
+ * transaction protected by an authenticated `TenantContext`:
+ *   1. `SET LOCAL ROLE konnexy_app` (least-privilege role with `NOBYPASSRLS`)
+ *   2. `SELECT set_config('app.current_organization_id', context.organizationId, true)`
+ *
+ * CRITICAL SECURITY INVARIANT (Stage 2.2 P0 & P1):
+ * - Accepts ONLY an authenticated `TenantContext` object (isolated `organizationId` strings are rejected).
+ * - Requires Neon in production (zero silent fallback to PGlite).
+ * - Strongly typed `DrizzleQueryExecutor` callback (zero `any`).
+ */
+export async function withTenantTransaction<T>(
+  context: TenantContext,
+  callback: (tx: DrizzleQueryExecutor) => Promise<T>,
+  options?: {
+    readonly connectionString?: string;
+    readonly customPg?: PGlite;
+    readonly forceNeonDriver?: boolean;
+    readonly neonPoolFactory?: (connStr: string) => Pool;
+  }
+): Promise<T> {
+  const authCtx = assertAuthenticatedDbContext(context);
+  const organizationId = authCtx.organizationId;
+
+  if (options?.customPg) {
+    if (!isExplicitPgliteTestOrDevAllowed(process.env)) {
+      throw new DatabaseConfigurationError(
+        "customPg is not allowed in production."
+      );
+    }
+    const pgliteDb = drizzlePglite(options.customPg, { schema });
+    return await pgliteDb.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
+      await tx.execute(
+        sql`SELECT set_config('app.current_organization_id', ${organizationId}, true)`
+      );
+      return await callback(tx as unknown as DrizzleQueryExecutor);
+    });
+  }
+
+  const url = options?.connectionString ?? process.env.DATABASE_URL;
+  const validated = validateRequiredDatabaseUrl({
+    connectionString: url,
+    allowExplicitPglite: !options?.forceNeonDriver,
+  });
+
+  if (options?.forceNeonDriver || validated.mode === "NEON") {
+    const connStr = validated.connectionString ?? url ?? "";
+    if (!connStr) {
+      throw new DatabaseConfigurationError(
+        "DATABASE_URL is required for Neon tenant transaction."
+      );
+    }
+    const pool = options?.neonPoolFactory
+      ? options.neonPoolFactory(connStr)
+      : new Pool({ connectionString: connStr });
     const db = drizzleServerless(pool, { schema });
 
     try {
@@ -201,18 +404,12 @@ export async function withTenantTransaction<T>(
     }
   }
 
-  const runtime = options?.customPg
-    ? {
-        pg: options.customPg,
-        db: drizzlePglite(options.customPg, { schema }),
-      }
-    : await getOperationalPostgresRuntime();
-
+  const runtime = await getExplicitTestOrDevPglite();
   return await runtime.db.transaction(async (tx) => {
     await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
     await tx.execute(
       sql`SELECT set_config('app.current_organization_id', ${organizationId}, true)`
     );
-    return await callback(tx);
+    return await callback(tx as unknown as DrizzleQueryExecutor);
   });
 }

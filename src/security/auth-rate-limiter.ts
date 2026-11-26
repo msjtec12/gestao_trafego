@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { eq } from "drizzle-orm";
+import type { DrizzleQueryExecutor } from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 
 export interface RateLimitEntry {
@@ -85,8 +86,7 @@ export class AuthAbuseRateLimiter {
  */
 export class PersistentPostgresAuthRateLimiter {
   constructor(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private readonly db: any,
+    private readonly db: DrizzleQueryExecutor,
     private readonly maxAttempts = 5,
     private readonly windowMs = 15 * 60 * 1000,
     private readonly lockoutDurationMs = 15 * 60 * 1000

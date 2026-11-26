@@ -65,7 +65,7 @@ type ManagementTab =
 
 export function TenantManagementHub({
   activeOrganization,
-  clients,
+  clients: initialClients,
   adAccounts,
   members,
   integrations,
@@ -73,11 +73,17 @@ export function TenantManagementHub({
   auditTrail = [],
 }: TenantManagementHubProps) {
   const router = useRouter();
+  const [clients, setClients] =
+    React.useState<readonly ClientRecordViewModel[]>(initialClients);
   const [activeTab, setActiveTab] = React.useState<ManagementTab>("clients");
   const [clientName, setClientName] = React.useState("");
   const [clientIndustry, setClientIndustry] = React.useState("");
   const [monthlyBudgetBrl, setMonthlyBudgetBrl] = React.useState("5000");
   const [targetCpaBrl, setTargetCpaBrl] = React.useState("45");
+
+  React.useEffect(() => {
+    setClients(initialClients);
+  }, [initialClients]);
 
   const [editingClientId, setEditingClientId] = React.useState<string | null>(
     null
@@ -114,6 +120,15 @@ export function TenantManagementHub({
       if (!res.ok) {
         setFormError(res.error ?? "Erro ao cadastrar cliente.");
         return;
+      }
+
+      if (res.client) {
+        const persistedClient = res.client;
+        setClients((prev) =>
+          prev.some((c) => c.id === persistedClient.id)
+            ? prev
+            : [...prev, persistedClient]
+        );
       }
 
       setClientName("");
@@ -297,9 +312,11 @@ export function TenantManagementHub({
             return (
               <button
                 key={tab.id}
+                id={`management-tab-${tab.id}`}
                 type="button"
                 role="tab"
                 aria-selected={isSelected}
+                aria-controls={`management-panel-${tab.id}`}
                 onClick={() => setActiveTab(tab.id)}
                 className={`inline-flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-colors cursor-pointer ${
                   isSelected
@@ -307,7 +324,10 @@ export function TenantManagementHub({
                     : "text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800/70"
                 }`}
               >
-                <Icon className="h-3.5 w-3.5 text-cyan-500 dark:text-cyan-400" />
+                <Icon
+                  className="h-3.5 w-3.5 text-cyan-500 dark:text-cyan-400"
+                  aria-hidden="true"
+                />
                 <span>{tab.label}</span>
                 {tab.count !== undefined && (
                   <span className="rounded-full bg-slate-200 dark:bg-slate-800 px-1.5 py-0.2 text-[10px]">
@@ -320,7 +340,12 @@ export function TenantManagementHub({
         </div>
       </CardHeader>
 
-      <CardContent className="space-y-4">
+      <CardContent
+        id={`management-panel-${activeTab}`}
+        role="tabpanel"
+        aria-labelledby={`management-tab-${activeTab}`}
+        className="space-y-4"
+      >
         {formError && (
           <div
             role="alert"
@@ -410,7 +435,7 @@ export function TenantManagementHub({
             {clients.length === 0 ? (
               <div
                 data-testid="clients-empty-state"
-                className="rounded-xl border border-dashed border-slate-300 dark:border-slate-800 py-10 text-center text-xs text-slate-500"
+                className="rounded-xl border border-dashed border-slate-300 dark:border-slate-700 py-10 text-center text-xs text-slate-600 dark:text-slate-300"
               >
                 Nenhum cliente cadastrado para esta organização no PostgreSQL
                 (Empty State).
@@ -471,7 +496,10 @@ export function TenantManagementHub({
                         <>
                           <div className="flex items-start justify-between gap-2">
                             <div>
-                              <span className="font-semibold text-slate-900 dark:text-slate-100 block">
+                              <span
+                                data-testid={`client-card-name-${client.id}`}
+                                className="font-semibold text-slate-900 dark:text-slate-100 block"
+                              >
                                 {client.name}
                               </span>
                               <span className="text-slate-500 dark:text-slate-400">

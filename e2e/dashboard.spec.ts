@@ -1,8 +1,33 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
-test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suite", () => {
-  test("1. Enforces route & API protection: redirects unauthenticated '/' to '/login' and blocks '/api/integrations/google-ads/authorize' with 401", async ({
+async function assertNoSeriousOrCriticalAxeViolations(
+  page: Page,
+  contextLabel: string
+): Promise<void> {
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa"])
+    .analyze();
+
+  const seriousOrCritical = results.violations.filter(
+    (v) => v.impact === "critical" || v.impact === "serious"
+  );
+
+  expect(
+    seriousOrCritical,
+    `Axe WCAG serious/critical violations on ${contextLabel}: ${JSON.stringify(
+      seriousOrCritical.map((v) => ({
+        id: v.id,
+        impact: v.impact,
+        description: v.description,
+        nodes: v.nodes.map((n) => n.html),
+      }))
+    )}`
+  ).toEqual([]);
+}
+
+test.describe("Konnexy Ads Stage 2.2 Production Readiness, Unified Auth.js & WCAG Accessibility Suite", () => {
+  test("1. Enforces route & API protection: redirects unauthenticated '/' to '/login', blocks '/api/integrations/google-ads/authorize' with 401, and passes Axe on /login & /onboarding", async ({
     page,
     request,
   }) => {
@@ -16,12 +41,26 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
     await expect(
       page.getByRole("heading", { name: /KONNEXY ADS/i })
     ).toBeVisible();
+
+    await assertNoSeriousOrCriticalAxeViolations(page, "Login Page (/login)");
+
+    await page.goto("/onboarding");
+    await expect(
+      page.getByRole("heading", {
+        name: /Onboarding — Criar Organização Multi-Tenant/i,
+      })
+    ).toBeVisible();
+    await assertNoSeriousOrCriticalAxeViolations(
+      page,
+      "Onboarding Page (/onboarding)"
+    );
   });
 
-  test("2. Full Operational Flow: Onboarding -> Persistent Client Creation -> Survives Reload -> Logout -> Login & Error State", async ({
+  test("2. Full Operational Flow: Onboarding -> Auth.js Session Cookie -> Persistent Client Creation -> Immediate UI Update -> Survives Reload -> Axe Audit -> Logout -> Login", async ({
     page,
+    context,
   }) => {
-    const uniqueSuffix = Date.now();
+    const uniqueSuffix = `${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     const userEmail = `operador.${uniqueSuffix}@konnexy.com.br`;
     const orgSlug = `konnexy-agencia-${uniqueSuffix}`;
     const clientName = `Clínica Persistente ${uniqueSuffix}`;
@@ -41,11 +80,18 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
     await page.getByTestId("onboard-orgslug-input").fill(orgSlug);
     await page.getByTestId("onboard-submit-btn").click();
 
-    // Must land on authenticated operational dashboard '/' (first render applies PGlite migrations)
-    await expect(page).toHaveURL("http://localhost:3100/", { timeout: 25000 });
+    // Must land on authenticated operational dashboard '/'
+    await expect(page).toHaveURL(/\/$/, { timeout: 25000 });
     await expect(
       page.getByTestId("environment-scope-badge")
     ).toContainText(/AMBIENTE OPERACIONAL \(SEM DADOS SIMULADOS\)/i);
+
+    // Verify unified Auth.js session cookie ('authjs.session-token') was issued
+    const cookies = await context.cookies();
+    const authJsCookie = cookies.find(
+      (c) => c.name === "authjs.session-token"
+    );
+    expect(authJsCookie).toBeDefined();
 
     // Initially no fake campaigns or fake metrics exist ("Sem dados")
     await expect(page.getByText("Sem dados").first()).toBeVisible();
@@ -62,17 +108,33 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
     await expect(
       page.getByTestId("management-success-status")
     ).toBeVisible();
-    await expect(
-      page.locator("span, p", { hasText: clientName }).first()
-    ).toBeVisible();
 
-    // Reload the page and prove the client was persisted in PostgreSQL (not React local state)
+    // Unique card locator verifying immediate UI update after Server Action
+    const clientCardHeading = page
+      .locator('[data-testid^="client-card-name-"]', { hasText: clientName })
+      .first();
+    await expect(clientCardHeading).toBeVisible();
+
+    // Run Axe accessibility audit on the Authenticated Operational Dashboard
+    await assertNoSeriousOrCriticalAxeViolations(
+      page,
+      "Authenticated Operational Dashboard (/)"
+    );
+
+    // Reload the page and prove the client was persisted in PostgreSQL (and present in the server-rendered selector)
     await page.reload();
     await expect(
-      page.locator("span, p", { hasText: clientName }).first()
+      page
+        .locator('[data-testid^="client-card-name-"]', { hasText: clientName })
+        .first()
     ).toBeVisible();
+    await expect(
+      page.getByTestId("client-selector").locator("option", {
+        hasText: clientName,
+      })
+    ).toHaveCount(1);
 
-    // Logout and verify redirect to /login
+    // Logout and verify redirect to /login and cookie deletion / DB revocation
     await page.getByTestId("logout-btn").click();
     await expect(page).toHaveURL(/\/login/);
 
@@ -82,25 +144,33 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
     await page.getByTestId("login-submit-btn").click();
     await expect(page.getByTestId("login-error-alert")).toBeVisible();
 
-    // Login with valid credentials and verify persistent client is still there
+    // Login with valid credentials and verify persistent client is still in PostgreSQL
     await page
       .getByTestId("login-password-input")
       .fill("SenhaForte#2026Konnexy");
     await page.getByTestId("login-submit-btn").click();
-    await expect(page).toHaveURL("http://localhost:3100/", { timeout: 20000 });
+    await expect(page).toHaveURL(/\/$/, { timeout: 20000 });
     await expect(
-      page.locator("span, p", { hasText: clientName }).first()
+      page
+        .locator('[data-testid^="client-card-name-"]', { hasText: clientName })
+        .first()
     ).toBeVisible();
   });
 
-  test("3. Public Demonstration Environment (/demo) is isolated, supports Ctrl+K Command Palette, and passes Automated Axe Accessibility Audit", async ({
+  test("3. Public Demonstration Environment (/demo) is isolated, renders unique demo-mode-banner, supports Ctrl+K Command Palette, and passes Axe Accessibility Audit (including dialog)", async ({
     page,
   }) => {
     await page.goto("/demo");
     const banner = page.getByTestId("demo-mode-banner");
+    await expect(banner).toHaveCount(1);
     await expect(banner).toBeVisible();
     await expect(banner).toContainText(
       /AMBIENTE DEMONSTRATIVO \(FOUNDATION STAGE/i
+    );
+
+    await assertNoSeriousOrCriticalAxeViolations(
+      page,
+      "Public Demo Environment (/demo)"
     );
 
     const openBtn = page.getByRole("button", {
@@ -112,18 +182,14 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
       name: /Command Palette Konnexy Ads/i,
     });
     await expect(dialog).toBeVisible();
+
+    await assertNoSeriousOrCriticalAxeViolations(
+      page,
+      "Command Palette Dialog"
+    );
+
     await page.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
-
-    // Run automated WCAG accessibility check with @axe-core/playwright
-    const accessibilityScanResults = await new AxeBuilder({ page })
-      .withTags(["wcag2a", "wcag2aa"])
-      .analyze();
-
-    const criticalViolations = accessibilityScanResults.violations.filter(
-      (v) => v.impact === "critical"
-    );
-    expect(criticalViolations).toEqual([]);
   });
 
   const viewports = [
@@ -141,6 +207,7 @@ test.describe("Konnexy Ads Stage 2.1 Operational Completion & Accessibility Suit
       await page.setViewportSize({ width: vp.width, height: vp.height });
       await page.goto("/demo");
 
+      await expect(page.getByTestId("demo-mode-banner")).toHaveCount(1);
       await expect(page.getByTestId("demo-mode-banner")).toBeVisible();
       await expect(
         page.getByRole("heading", {

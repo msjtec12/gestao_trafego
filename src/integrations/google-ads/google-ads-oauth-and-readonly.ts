@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { and, eq } from "drizzle-orm";
 import type { TenantContext } from "@/domain/types";
+import type { DrizzleQueryExecutor } from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 import {
   assertPermission,
@@ -257,8 +258,7 @@ export function buildGoogleAdsReadOnlyHeaders(params: {
  */
 export class PersistentPostgresGoogleAdsService {
   constructor(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private readonly db: any,
+    private readonly db: DrizzleQueryExecutor,
     private readonly keyRing: string | KeyRing,
     private readonly activeKeyVersion = "v1"
   ) {}
@@ -464,6 +464,10 @@ export class PersistentPostgresGoogleAdsService {
       })
       .returning();
 
+    if (!inserted) {
+      throw new Error("Falha ao criar registro de integração no PostgreSQL.");
+    }
+
     const aad = {
       organizationId: context.organizationId,
       integrationId: inserted.id,
@@ -499,6 +503,10 @@ export class PersistentPostgresGoogleAdsService {
         )
       )
       .returning();
+
+    if (!updated) {
+      throw new Error("Falha ao persistir tokens criptografados na integração.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: context.organizationId,

@@ -577,14 +577,14 @@ export function DashboardOverview({
             </div>
 
             <div className="pt-2 border-t border-slate-200 dark:border-slate-800">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400 block mb-2">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-300 block mb-2">
                 Fluxo Obrigatório Auditável
               </span>
               <div className="flex flex-wrap gap-1.5">
                 {MANDATORY_PIPELINE_STAGES.map((stage) => (
                   <span
                     key={stage}
-                    className="text-[11px] rounded bg-cyan-500/10 border border-cyan-500/30 text-cyan-700 dark:text-cyan-300 px-2 py-0.5"
+                    className="text-[11px] rounded bg-cyan-950 border border-cyan-600/50 text-cyan-100 px-2 py-0.5"
                   >
                     {stage}
                   </span>

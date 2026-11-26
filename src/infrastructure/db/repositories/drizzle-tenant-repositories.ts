@@ -1,7 +1,10 @@
 import crypto from "crypto";
 import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import type { TenantContext, UserRole } from "@/domain/types";
-import { assertAuthenticatedDbContext } from "@/infrastructure/db";
+import {
+  assertAuthenticatedDbContext,
+  type DrizzleQueryExecutor,
+} from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 import {
   assertClientScopeAccess,
@@ -75,8 +78,7 @@ export interface AggregatedPeriodMetricsResult {
  * OWNER membership, persistent user_session, and audit log entry.
  */
 export async function onboardFirstOrganizationRepository(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  tx: any,
+  tx: DrizzleQueryExecutor,
   rawInput: OnboardingInput,
   options?: { readonly nowMs?: number }
 ): Promise<{
@@ -135,6 +137,10 @@ export async function onboardFirstOrganizationRepository(
     })
     .returning();
 
+  if (!createdUser || !createdOrg) {
+    throw new Error("Falha ao criar usuário ou organização no PostgreSQL.");
+  }
+
   const [createdMembership] = await tx
     .insert(schema.memberships)
     .values({
@@ -143,6 +149,10 @@ export async function onboardFirstOrganizationRepository(
       role: "OWNER",
     })
     .returning();
+
+  if (!createdMembership) {
+    throw new Error("Falha ao criar membership OWNER no PostgreSQL.");
+  }
 
   const sessionToken = `ksess_${crypto.randomBytes(32).toString("hex")}`;
   await tx.insert(schema.userSessions).values({
@@ -180,8 +190,7 @@ export async function onboardFirstOrganizationRepository(
  * `user_sessions`, and recording audit events in `audit_logs`.
  */
 export async function authenticateUserWithPostgres(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  db: any,
+  db: DrizzleQueryExecutor,
   params: {
     readonly email: string;
     readonly password: string;
@@ -283,8 +292,7 @@ export async function authenticateUserWithPostgres(
  * authoritative server-validated `TenantContext`.
  */
 export async function resolveSessionFromPostgres(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  db: any,
+  db: DrizzleQueryExecutor,
   params: {
     readonly sessionToken: string | null | undefined;
     readonly requestedOrganizationId?: string;
@@ -422,8 +430,7 @@ export async function resolveSessionFromPostgres(
  * Revokes an active user session in PostgreSQL and records an audit log entry.
  */
 export async function revokeSessionInPostgres(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  db: any,
+  db: DrizzleQueryExecutor,
   sessionToken: string
 ): Promise<void> {
   const trimmed = sessionToken.trim();
@@ -458,8 +465,7 @@ export async function revokeSessionInPostgres(
  * server-side membership.
  */
 export async function switchActiveOrganizationInPostgres(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  db: any,
+  db: DrizzleQueryExecutor,
   params: {
     readonly sessionToken: string;
     readonly targetOrganizationId: string;
@@ -496,8 +502,7 @@ export async function switchActiveOrganizationInPostgres(
  * Daily Metrics, Budgets, Sync Runs, and Audit Logs.
  */
 export class PersistentDrizzleTenantRepository {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  constructor(private readonly db: any) {}
+  constructor(private readonly db: DrizzleQueryExecutor) {}
 
   public async getOrganization(
     context: TenantContext
@@ -552,6 +557,10 @@ export class PersistentDrizzleTenantRepository {
       })
       .where(eq(schema.organizations.id, authCtx.organizationId))
       .returning();
+
+    if (!updated) {
+      throw new Error("Falha ao atualizar organização.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
@@ -627,6 +636,10 @@ export class PersistentDrizzleTenantRepository {
       })
       .returning();
 
+    if (!created) {
+      throw new Error("Falha ao criar cliente no PostgreSQL.");
+    }
+
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
       actorUserId: authCtx.userId,
@@ -696,6 +709,10 @@ export class PersistentDrizzleTenantRepository {
       )
       .returning();
 
+    if (!updated) {
+      throw new Error("Falha ao atualizar cliente no PostgreSQL.");
+    }
+
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
       actorUserId: authCtx.userId,
@@ -758,6 +775,10 @@ export class PersistentDrizzleTenantRepository {
       )
       .returning();
 
+    if (!updated) {
+      throw new Error("Falha ao inativar cliente no PostgreSQL.");
+    }
+
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
       actorUserId: authCtx.userId,
@@ -790,6 +811,10 @@ export class PersistentDrizzleTenantRepository {
         clientId: params.clientId,
       })
       .returning();
+
+    if (!created) {
+      throw new Error("Falha ao vincular escopo de cliente.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
@@ -850,6 +875,10 @@ export class PersistentDrizzleTenantRepository {
         )
       )
       .returning();
+
+    if (!updated) {
+      throw new Error("Falha ao atualizar papel do membro.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
@@ -935,6 +964,10 @@ export class PersistentDrizzleTenantRepository {
         )
       )
       .returning();
+
+    if (!updated) {
+      throw new Error("Falha ao atualizar seleção de conta.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
@@ -1071,6 +1104,9 @@ export class PersistentDrizzleTenantRepository {
           )
         )
         .returning();
+      if (!updated) {
+        throw new Error("Falha ao atualizar campanha.");
+      }
       return updated;
     }
 
@@ -1090,6 +1126,9 @@ export class PersistentDrizzleTenantRepository {
       })
       .returning();
 
+    if (!inserted) {
+      throw new Error("Falha ao inserir campanha.");
+    }
     return inserted;
   }
 
