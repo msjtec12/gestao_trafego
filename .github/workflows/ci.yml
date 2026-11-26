@@ -1,0 +1,62 @@
+name: Konnexy Ads CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "foundation/**"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-and-security:
+    name: Lint, Typecheck, Audit, Test & Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      NODE_ENV: test
+      NEXT_PUBLIC_APP_NAME: "Konnexy Ads"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+      NEXT_PUBLIC_DEFAULT_EXECUTION_MODE: "READ_ONLY"
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/konnexy_ads_test"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Security Audit (High/Critical vulnerabilities)
+        run: pnpm audit --audit-level=high || true
+
+      - name: Run ESLint
+        run: pnpm lint
+
+      - name: Run TypeScript Strict Typecheck
+        run: pnpm typecheck
+
+      - name: Run Vitest Suite (Tenant Isolation, RBAC, Automation, Idempotency)
+        run: pnpm test
+
+      - name: Build Next.js Production Application
+        run: pnpm build
