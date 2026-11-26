@@ -5,6 +5,7 @@ import {
   type MutationSimulationResult,
   type NormalizedCampaign,
   type NormalizedDailyMetric,
+  type PostExecutionVerificationResult,
   type ProviderHealthStatus,
   ProviderIntegrationError,
 } from "../contracts/advertising-provider";
@@ -13,7 +14,8 @@ export interface MockProviderOptions {
   readonly simulateFailure?:
     | "RATE_LIMIT_EXCEEDED"
     | "AUTH_TOKEN_REVOKED"
-    | "PROVIDER_TIMEOUT";
+    | "PROVIDER_TIMEOUT"
+    | "VERIFICATION_MISMATCH";
 }
 
 export class MockAdsProvider implements AdvertisingProvider {
@@ -74,6 +76,7 @@ export class MockAdsProvider implements AdvertisingProvider {
       {
         id: "camp-demo-01",
         organizationId,
+        clientId: "client-sorriso-prime",
         externalCampaignId: "GADS-99102-SEARCH",
         clientName: "Clínica Odontológica Sorriso Prime (SP)",
         name: "[DEMO] Search — Implantes & Invisalign Zona Sul",
@@ -89,12 +92,55 @@ export class MockAdsProvider implements AdvertisingProvider {
         ctr7dPct: 7.85,
         impressions7d: 18900,
         clicks7d: 1484,
+        metricsByWindowDays: {
+          3: {
+            windowDays: 3,
+            spendBrl: 640,
+            conversions: 18,
+            cpaBrl: 35.55,
+            roas: 6.3,
+            ctrPct: 7.9,
+            impressions: 8100,
+            clicks: 640,
+          },
+          7: {
+            windowDays: 7,
+            spendBrl: 1480.5,
+            conversions: 42,
+            cpaBrl: 35.25,
+            roas: 6.4,
+            ctrPct: 7.85,
+            impressions: 18900,
+            clicks: 1484,
+          },
+          14: {
+            windowDays: 14,
+            spendBrl: 2950,
+            conversions: 85,
+            cpaBrl: 34.7,
+            roas: 6.5,
+            ctrPct: 7.8,
+            impressions: 37800,
+            clicks: 2948,
+          },
+          30: {
+            windowDays: 30,
+            spendBrl: 6200,
+            conversions: 178,
+            cpaBrl: 34.83,
+            roas: 6.45,
+            ctrPct: 7.75,
+            impressions: 79000,
+            clicks: 6122,
+          },
+        },
         isDemoData: true,
         lastAutomatedChangeAt: null,
       },
       {
         id: "camp-demo-02",
         organizationId,
+        clientId: "client-cfc-via-rapida",
         externalCampaignId: "GADS-99108-PMAX",
         clientName: "Autoescola & CFC Via Rápida",
         name: "[DEMO] PMax — Primeira Habilitação A/B Local",
@@ -116,6 +162,7 @@ export class MockAdsProvider implements AdvertisingProvider {
       {
         id: "camp-demo-03",
         organizationId,
+        clientId: "client-fiscaltech",
         externalCampaignId: "GADS-99115-SEARCH",
         clientName: "Escritório Contábil FiscalTech B2B",
         name: "[DEMO] Search — Abertura de Empresa & Migração MEI",
@@ -131,12 +178,45 @@ export class MockAdsProvider implements AdvertisingProvider {
         ctr7dPct: 3.15,
         impressions7d: 14200,
         clicks7d: 447,
+        metricsByWindowDays: {
+          3: {
+            windowDays: 3,
+            spendBrl: 520,
+            conversions: 5,
+            cpaBrl: 104.0,
+            roas: 1.8,
+            ctrPct: 3.1,
+            impressions: 6100,
+            clicks: 189,
+          },
+          7: {
+            windowDays: 7,
+            spendBrl: 1210.0,
+            conversions: 14,
+            cpaBrl: 86.42,
+            roas: 2.1,
+            ctrPct: 3.15,
+            impressions: 14200,
+            clicks: 447,
+          },
+          30: {
+            windowDays: 30,
+            spendBrl: 4800.0,
+            conversions: 96,
+            cpaBrl: 50.0,
+            roas: 4.2,
+            ctrPct: 3.4,
+            impressions: 58000,
+            clicks: 1972,
+          },
+        },
         isDemoData: true,
         lastAutomatedChangeAt: null,
       },
       {
         id: "camp-demo-04",
         organizationId,
+        clientId: "client-lumina-estetica",
         externalCampaignId: "META-88301-ADV",
         clientName: "Studio Estética Avançada Lumina",
         name: "[DEMO] Meta Advantage+ — Harmonização & Botox WhatsApp",
@@ -158,6 +238,7 @@ export class MockAdsProvider implements AdvertisingProvider {
       {
         id: "camp-demo-05",
         organizationId,
+        clientId: "client-petvida",
         externalCampaignId: "GADS-99142-LOCAL",
         clientName: "Hospital Veterinário 24h PetVida",
         name: "[DEMO] Search Emergência 24h — Raio 8km",
@@ -179,6 +260,7 @@ export class MockAdsProvider implements AdvertisingProvider {
       {
         id: "camp-demo-06",
         organizationId,
+        clientId: "client-primehouse",
         externalCampaignId: "GADS-99199-BROAD",
         clientName: "Imobiliária Alto Padrão PrimeHouse",
         name: "[DEMO] Search — Termos Amplos Genéricos (Alerta CPA)",
@@ -200,6 +282,7 @@ export class MockAdsProvider implements AdvertisingProvider {
       {
         id: "camp-demo-07",
         organizationId,
+        clientId: "client-sorriso-prime",
         externalCampaignId: "META-88390-REMARKETING",
         clientName: "Clínica Odontológica Sorriso Prime (SP)",
         name: "[DEMO] Remarketing 30d — Avaliações Agendadas",
@@ -333,6 +416,32 @@ export class MockAdsProvider implements AdvertisingProvider {
         appliedPayload: request.payload,
         isSimulatedSandbox: true,
       },
+    };
+  }
+
+  public async verifyMutation(
+    request: CampaignMutationRequest,
+    executionResult: MutationExecutionResult
+  ): Promise<PostExecutionVerificationResult> {
+    if (this.options.simulateFailure === "VERIFICATION_MISMATCH") {
+      return {
+        verified: false,
+        provider: "MOCK_ADS",
+        externalTransactionId: executionResult.externalTransactionId,
+        observedState: { campaignId: request.campaignId, status: "DRIFT_DETECTED" },
+        discrepancyReason:
+          "Post-execution verification detected state drift between requested payload and provider state.",
+      };
+    }
+
+    return {
+      verified:
+        executionResult.success &&
+        executionResult.verifiedState.campaignId === request.campaignId &&
+        executionResult.verifiedState.actionType === request.actionType,
+      provider: "MOCK_ADS",
+      externalTransactionId: executionResult.externalTransactionId,
+      observedState: executionResult.verifiedState,
     };
   }
 }
