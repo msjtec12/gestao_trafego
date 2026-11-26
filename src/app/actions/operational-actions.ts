@@ -16,6 +16,10 @@ import {
 import { PersistentPostgresGoogleAdsService } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
 import { PersistentPostgresAdsSyncEngine } from "@/workflows/incremental-sync-engine";
 import {
+  PersistentAIRecommendationsAndReportsRepository,
+  type PersistedExecutiveReport,
+} from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
+import {
   issueUnifiedAuthJsSessionCookie,
   resolveUnifiedAuthJsPostgresSession,
   revokeUnifiedAuthJsSession,
@@ -524,3 +528,142 @@ export async function requestSyncServerAction(
     };
   }
 }
+
+const ReviewRecommendationInputSchema = z.object({
+  recommendationId: z.string().uuid("ID da recomendação inválido."),
+  decision: z.enum(["APPROVED", "REJECTED"]),
+  decisionNotes: z.string().max(500).optional(),
+});
+
+const GenerateExecutiveReportInputSchema = z.object({
+  clientId: z.string().uuid("ID do cliente inválido."),
+  periodStart: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Data inicial inválida."),
+  periodEnd: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "Data final inválida."),
+});
+
+export async function runSupervisedAIAnalysisServerAction(rawInput?: {
+  readonly clientId?: string;
+}): Promise<{
+  readonly ok: boolean;
+  readonly createdCount?: number;
+  readonly blockedByPolicyCount?: number;
+  readonly generationMode?: string;
+  readonly error?: string;
+}> {
+  try {
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const result = await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
+      return await repo.runSupervisedAIAnalysisAndPersist(session.context, {
+        clientId: rawInput?.clientId,
+      });
+    });
+
+    revalidatePath("/");
+    return {
+      ok: true,
+      createdCount: result.createdCount,
+      blockedByPolicyCount: result.blockedByPolicyCount,
+      generationMode: result.generationMode,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível executar a análise supervisionada de IA."
+      ).publicMessage,
+    };
+  }
+}
+
+export async function reviewRecommendationServerAction(rawInput: {
+  readonly recommendationId: string;
+  readonly decision: "APPROVED" | "REJECTED";
+  readonly decisionNotes?: string;
+}): Promise<{
+  readonly ok: boolean;
+  readonly approvalId?: string;
+  readonly actionPayloadHash?: string;
+  readonly status?: "APPROVED" | "REJECTED";
+  readonly error?: string;
+}> {
+  try {
+    const parsed = ReviewRecommendationInputSchema.safeParse(rawInput);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error:
+          parsed.error.issues[0]?.message ?? "Dados de revisão inválidos.",
+      };
+    }
+
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const result = await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
+      return await repo.reviewRecommendationWithPayloadBoundApproval(
+        session.context,
+        parsed.data
+      );
+    });
+
+    revalidatePath("/");
+    return {
+      ok: true,
+      approvalId: result.approval.id,
+      actionPayloadHash: result.approval.actionPayloadHash,
+      status: parsed.data.decision,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível registrar a aprovação assinada."
+      ).publicMessage,
+    };
+  }
+}
+
+export async function generateExecutiveReportServerAction(rawInput: {
+  readonly clientId: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+}): Promise<{
+  readonly ok: boolean;
+  readonly report?: PersistedExecutiveReport;
+  readonly error?: string;
+}> {
+  try {
+    const parsed = GenerateExecutiveReportInputSchema.safeParse(rawInput);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error:
+          parsed.error.issues[0]?.message ??
+          "Parâmetros inválidos para geração do relatório executivo.",
+      };
+    }
+
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const report = await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
+      return await repo.generateAndPersistExecutiveReport(
+        session.context,
+        parsed.data
+      );
+    });
+
+    revalidatePath("/");
+    return { ok: true, report };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível gerar o relatório executivo."
+      ).publicMessage,
+    };
+  }
+}
+

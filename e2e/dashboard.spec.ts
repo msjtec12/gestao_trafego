@@ -121,11 +121,31 @@ test.describe("Konnexy Ads Stage 2.2 Production Readiness, Unified Auth.js & WCA
       "Authenticated Operational Dashboard (/)"
     );
 
-    // Reload the page and prove the client was persisted in PostgreSQL (and present in the server-rendered selector)
+    // Stage 3: Generate a persistent Executive Report for the newly created client
+    await page.getByTestId("generate-executive-report-btn").click();
+    await expect(
+      page.getByTestId("ai-center-success-status")
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[data-testid^="executive-report-title-"]', {
+          hasText: clientName,
+        })
+        .first()
+    ).toBeVisible();
+
+    // Reload the page and prove BOTH the client and the executive report were persisted in PostgreSQL
     await page.reload();
     await expect(
       page
         .locator('[data-testid^="client-card-name-"]', { hasText: clientName })
+        .first()
+    ).toBeVisible();
+    await expect(
+      page
+        .locator('[data-testid^="executive-report-title-"]', {
+          hasText: clientName,
+        })
         .first()
     ).toBeVisible();
     await expect(

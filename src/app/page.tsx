@@ -42,6 +42,8 @@ export default async function HomePage() {
       campaigns={vm.campaigns}
       dailyMetrics={vm.dailyMetrics}
       recommendations={vm.recommendations}
+      persistedRecommendations={vm.persistedRecommendations}
+      executiveReports={vm.executiveReports}
       domainTables={vm.domainTables}
     />
   );

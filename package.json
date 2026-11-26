@@ -15,7 +15,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:unit": "vitest run src/tests/architecture-and-governance.test.ts src/tests/stage2-auth-google-ads-sync.test.ts",
-    "test:pglite": "vitest run src/tests/postgres-rls-integration.test.ts src/tests/stage2-1-operational-completion.test.ts",
+    "test:pglite": "vitest run src/tests/postgres-rls-integration.test.ts src/tests/stage2-1-operational-completion.test.ts src/tests/stage3-supervised-ai-and-reports.test.ts",
     "test:neon": "vitest run src/tests/neon-driver-integration.test.ts",
     "test:watch": "vitest",
     "test:e2e": "playwright test",

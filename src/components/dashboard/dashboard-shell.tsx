@@ -16,6 +16,10 @@ import type {
   NormalizedDailyMetric,
 } from "@/integrations/contracts/advertising-provider";
 import type { AIRecommendation } from "@/modules/ai/schemas/recommendation-schemas";
+import type {
+  PersistedExecutiveReport,
+  PersistedRecommendationWithApproval,
+} from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
 import {
   switchOrganizationAction,
   toggleEmergencyStopServerAction,
@@ -44,6 +48,8 @@ export interface DashboardShellProps {
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
+  readonly persistedRecommendations?: readonly PersistedRecommendationWithApproval[];
+  readonly executiveReports?: readonly PersistedExecutiveReport[];
   readonly domainTables?: readonly string[];
 }
 
@@ -88,6 +94,8 @@ export function DashboardShell({
   campaigns,
   dailyMetrics,
   recommendations,
+  persistedRecommendations = [],
+  executiveReports = [],
   domainTables = DEFAULT_DOMAIN_TABLES,
 }: DashboardShellProps) {
   const router = useRouter();
@@ -221,6 +229,8 @@ export function DashboardShell({
           campaigns={campaigns}
           dailyMetrics={dailyMetrics}
           recommendations={recommendations}
+          persistedRecommendations={persistedRecommendations}
+          executiveReports={executiveReports}
           domainTables={domainTables}
           emergencyStopActive={emergencyStopActive}
           lastSyncTimestamp={lastSyncTimestamp}

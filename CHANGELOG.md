@@ -5,6 +5,18 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
+## [0.3.0] - 2026-11-26 — Stage 3: Supervised AI (9 Services), Payload-Bound Approvals & Executive Reports
+
+### Adicionado
+- **Orquestrador de IA Supervisionada (9 Serviços Especializados + Vercel AI SDK v6 + Zod)**:
+  - `SupervisedAIOrchestrator` (`src/modules/ai/services/supervised-ai-orchestrator.ts`) implementando `STRATEGY_ANALYZER`, `PERFORMANCE_ANALYZER`, `KEYWORD_ANALYZER`, `CONVERSION_ANALYZER`, `BUDGET_ANALYZER`, `LANDING_PAGE_AUDITOR`, `CREATIVE_GENERATOR`, `RECOMMENDATION_VALIDATOR` e `REPORT_GENERATOR` com sanitização anti-prompt injection e validação `PolicyEngine`/`RiskEngine`.
+- **Repositórios Persistentes RLS (`recommendations`, `approvals`, `reports`)**:
+  - `PersistentAIRecommendationsAndReportsRepository` com aprovações vinculadas ao hash SHA-256 canônico (`action_payload_hash`), isolamento cross-tenant, restrições RBAC para `CLIENT_VIEWER` e auditoria imutável.
+- **Interface `SupervisedAICenter` & Server Actions**:
+  - Execução dos 9 analisadores, revisão/aprovação assinada com exibição do hash SHA-256 e gerador de Relatórios Executivos para clientes integrados ao Dashboard Operacional.
+- **Testes**:
+  - Nova suíte `src/tests/stage3-supervised-ai-and-reports.test.ts` (48 testes Vitest aprovados) e cobertura E2E persistente de geração de relatórios executivos no Playwright (8/8 aprovados).
+
 ## [0.2.2] - 2026-11-26 — Stage 2.2: Production Readiness Hardening
 
 ### Segurança & Arquitetura (P0 / P1 / P2)

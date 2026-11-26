@@ -6,6 +6,11 @@ import {
   PersistentDrizzleTenantRepository,
   type AggregatedPeriodMetricsResult,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
+import {
+  PersistentAIRecommendationsAndReportsRepository,
+  type PersistedExecutiveReport,
+  type PersistedRecommendationWithApproval,
+} from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
 import { resolveUnifiedAuthJsPostgresSession } from "@/security/auth";
 import {
   GoogleAdsProvider,
@@ -136,6 +141,8 @@ export interface DashboardOverviewViewModel {
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
   readonly recommendations: AIRecommendation[];
+  readonly persistedRecommendations?: readonly PersistedRecommendationWithApproval[];
+  readonly executiveReports?: readonly PersistedExecutiveReport[];
   readonly domainTables: readonly string[];
 }
 
@@ -168,6 +175,16 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
     });
     const syncRunRows = await repo.listSyncRuns(session.context);
     const auditRows = await repo.listAuditLogs(session.context, 25);
+
+    const aiRepo = new PersistentAIRecommendationsAndReportsRepository(tx);
+    const persistedRecommendations = await aiRepo.listRecommendations(
+      session.context,
+      { clientId: params.clientId }
+    );
+    const executiveReports = await aiRepo.listExecutiveReports(
+      session.context,
+      { clientId: params.clientId }
+    );
 
     const aggregated = await repo.getAggregatedDashboardMetrics(
       session.context,
@@ -432,6 +449,8 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
       syncHistory: syncHistoryVm,
       auditTrail: auditTrailVm,
       recommendations: [],
+      persistedRecommendations,
+      executiveReports,
       domainTables: ALL_DOMAIN_TABLES,
     };
   });

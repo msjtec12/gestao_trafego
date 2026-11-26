@@ -26,6 +26,10 @@ import type {
   NormalizedDailyMetric,
 } from "@/integrations/contracts/advertising-provider";
 import type { AIRecommendation } from "@/modules/ai/schemas/recommendation-schemas";
+import type {
+  PersistedExecutiveReport,
+  PersistedRecommendationWithApproval,
+} from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
 import {
   formatCurrencyBrl,
   formatNumberPtBr,
@@ -42,6 +46,7 @@ import {
 import { PerformanceChart } from "./performance-chart";
 import { CampaignsTable } from "./campaigns-table";
 import { AIRecommendationsPanel } from "./ai-recommendations-panel";
+import { SupervisedAICenter } from "./supervised-ai-center";
 import { TenantManagementHub } from "./tenant-management-hub";
 
 export interface DashboardOverviewProps {
@@ -58,6 +63,8 @@ export interface DashboardOverviewProps {
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
+  readonly persistedRecommendations?: readonly PersistedRecommendationWithApproval[];
+  readonly executiveReports?: readonly PersistedExecutiveReport[];
   readonly domainTables: readonly string[];
   readonly emergencyStopActive: boolean;
   readonly lastSyncTimestamp: string | null;
@@ -122,6 +129,8 @@ export function DashboardOverview({
   campaigns,
   dailyMetrics,
   recommendations,
+  persistedRecommendations = [],
+  executiveReports = [],
   domainTables,
   emergencyStopActive,
   lastSyncTimestamp,
@@ -611,11 +620,21 @@ export function DashboardOverview({
         <CampaignsTable campaigns={scopedCampaigns} />
       </section>
 
-      <section id="ai-recommendations">
-        <AIRecommendationsPanel
-          recommendations={recommendations}
-          emergencyStopActive={emergencyStopActive}
-        />
+      <section id="ai-recommendations" className="space-y-6">
+        {activeOrganization.isDemo ? (
+          <AIRecommendationsPanel
+            recommendations={recommendations}
+            emergencyStopActive={emergencyStopActive}
+          />
+        ) : (
+          <SupervisedAICenter
+            isDemoEnvironment={activeOrganization.isDemo}
+            emergencyStopActive={emergencyStopActive}
+            clients={clients}
+            persistedRecommendations={persistedRecommendations}
+            executiveReports={executiveReports}
+          />
+        )}
       </section>
 
       <section id="architecture-docs">

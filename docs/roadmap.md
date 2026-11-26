@@ -21,10 +21,10 @@
 
 ---
 
-## Fase 3 — Inteligência Artificial Supervisionada & Centro de Recomendações
-- [ ] Integração dos 9 serviços especializados de IA com Vercel AI SDK v6 sobre métricas reais sincronizadas.
-- [ ] Interface dedicada de Revisão e Aprovação de Recomendações persistindo `ApprovalRecord` assinado no PostgreSQL.
-- [ ] Geração automatizada de Relatórios Executivos para clientes.
+## Fase 3 — Inteligência Artificial Supervisionada & Centro de Recomendações (Concluída)
+- [x] Integração dos 9 serviços especializados de IA com Vercel AI SDK v6 + Zod sobre métricas reais sincronizadas (`src/modules/ai/services/supervised-ai-orchestrator.ts`).
+- [x] Interface dedicada de Revisão e Aprovação de Recomendações (`SupervisedAICenter`) persistindo `ApprovalRecord` assinado (SHA-256 `action_payload_hash`) no PostgreSQL (`recommendations` + `approvals`).
+- [x] Geração automatizada de Relatórios Executivos para clientes persistidos na tabela `reports` com isolamento por tenant e `CLIENT_VIEWER`.
 
 ---
 
