@@ -1,8 +1,8 @@
 # Arquitetura de Segurança & Governança (DevSecOps & LGPD)
 
-## 1. Modelo de Controle de Acesso (RBAC)
+## 1. Modelo de Controle de Acesso (RBAC) e Escopo por Cliente
 
-O Konnexy Ads implementa RBAC estrito por organização (`memberships.role`):
+O Konnexy Ads implementa RBAC estrito por organização (`memberships.role`) com comportamento **fail-closed** (`src/security/rbac-and-tenant.ts`):
 
 | Papel (`Role`) | Visualizar Dashboard | Gerar Análise IA | Criar/Editar Regras | Aprovar Execuções Reais | Acionar Kill Switch | Gerenciar Integrações & Billing |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -10,29 +10,39 @@ O Konnexy Ads implementa RBAC estrito por organização (`memberships.role`):
 | `ADMIN` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `TRAFFIC_MANAGER` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
 | `ANALYST` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| `CLIENT_VIEWER` | ✅ (Somente Cliente) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `CLIENT_VIEWER` | ✅ (Restrito a `allowedClientIds`) | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+- **Autorização em Nível de Cliente (`assertClientScopeAccess`)**: Usuários com papel `CLIENT_VIEWER` exigem uma lista explícita `allowedClientIds` no contexto da sessão e são bloqueados caso tentem acessar recursos de outro cliente da mesma organização.
+- **Estado do Auth.js na Foundation 1.1**: A dependência `next-auth` foi atualizada para `5.0.0-beta.32` (corrigindo advisories críticos de versões anteriores a `beta.32`). A autenticação interativa completa permanece planejada para a Etapa 2, sem simular sessão falsa como se fosse autenticação real em produção.
 
 ---
 
-## 2. Isolamento Multi-Tenant
+## 2. Isolamento Multi-Tenant em Dupla Camada (Aplicação + PostgreSQL RLS)
 
-1. Todo acesso a dados passa pelo guarda `assertTenantAccess(sessionTenantId, targetOrganizationId)`.
-2. Caso um usuário autenticado na Organização A tente consultar ou modificar um recurso pertencente à Organização B, o sistema lança `TenantIsolationError` (HTTP 403) e registra um evento de segurança no `AuditEngine`.
-
----
-
-## 3. Criptografia de Credenciais OAuth (Credential Vault)
-
-- Tokens OAuth (`access_token`, `refresh_token`) nunca são armazenados em texto puro.
-- O módulo `src/security/encryption.ts` utiliza **AES-256-GCM** (Node.js `crypto`) com chave de 256 bits (`CREDENTIALS_ENCRYPTION_KEY`), IV aleatório de 12 bytes por operação e Auth Tag de 16 bytes para garantir confidencialidade e integridade autenticada.
+1. **Camada de Aplicação**:
+   - `assertTenantAccess(context, resourceOrganizationId)` e `validateTenantEntityChain(context, chain)` validam o vínculo completo entre Organização → Cliente → Conta de Anúncio → Campanha → Recomendação → Aprovação.
+2. **Camada de Banco de Dados (Neon PostgreSQL)**:
+   - Migration `0001_multi_tenant_rls_hardening.sql` habilita `ENABLE ROW LEVEL SECURITY` e `FORCE ROW LEVEL SECURITY` com políticas `USING` e `WITH CHECK` em todas as tabelas operacionais.
+   - Chaves estrangeiras compostas `(organization_id, id)` impedem em nível de constraint física que um registro da Organização A referencie uma entidade pai da Organização B.
+   - A role de aplicação `konnexy_app` é configurada com `NOBYPASSRLS NOSUPERUSER` e acionada por transação via `withTenantTransaction` (`SET LOCAL ROLE konnexy_app` + `set_config('app.current_organization_id', orgId, true)`).
 
 ---
 
-## 4. Proteções de Aplicação e Infraestrutura
+## 3. Criptografia de Credenciais OAuth (Credential Vault com Versionamento e AAD)
 
-- **Validação Server-Side**: Todos os payloads passam por schemas `Zod` no servidor.
-- **Proteção contra Prompt Injection**: Dados vindos de APIs externas (títulos de anúncios, termos de pesquisa, URLs de landing pages) são sanitizados e delimitados como dados não confiáveis antes de serem enviados aos analisadores de IA; modelos de IA não possuem permissão de invocação direta de métodos de mutação (`ExecutionEngine`).
-- **Proteção contra SSRF**: O `LandingPageAuditor` valida URLs contra IPs privados (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.169.254` metadata endpoints) e exige protocolo `https://`.
-- **Bloqueio de Produtos/Serviços Restritos**: O `PolicyEngine` bloqueia automaticamente campanhas ou criativos contendo termos associados a categorias ilegais ou restritas pelas políticas do Google Ads e Meta Ads (armas, drogas ilícitas, jogos de azar não licenciados, promessas médicas enganosas, etc.).
-- **Logs Sem Informações Sensíveis**: O utilitário `redactSensitiveData` mascara automaticamente chaves como `accessToken`, `refreshToken`, `clientSecret`, `password`, `authorization` e `apiKey`.
-- **PWA Seguro**: O Service Worker / Web Manifest não faz cache offline de respostas de APIs ou dados sensíveis de clientes (`Cache-Control: no-store`).
+- O módulo `src/security/vault-and-guards.ts` utiliza **AES-256-GCM** com:
+  - **Validação de Entropia**: Rejeita chaves zeradas ou de baixa entropia.
+  - **Versionamento de Chaves (`v1`, `v2`, ...)**: Formato `version:ivHex:authTagHex:cipherHex`, permitindo rotação de chaves sem indisponibilidade.
+  - **Additional Authenticated Data (AAD)**: Vincula criptograficamente o ciphertext ao par `org:<organizationId>|integration:<integrationId>`, impedindo que um token criptografado seja copiado para outra organização ou integração.
+
+---
+
+## 4. Proteções de Aplicação, SSRF, CSP e Governança de Repositório
+
+- **Validação de Ambiente com Zod (`src/security/env.ts`)**: `ServerEnvSchema` rejeita inicialização em `NODE_ENV=production` caso detecte secrets demonstrativos (`replace_with_*` ou chaves de baixa entropia).
+- **Proteção contra SSRF e DNS Rebinding**: `resolveAndValidateSafeExternalUrl` exige `https://`, bloqueia credenciais na URL, valida a resolução DNS (`dns.lookup`) contra faixas IPv4/IPv6 privadas, loopback, link-local (`169.254.0.0/16`), CGNAT (`100.64.0.0/10`) e desativa redirecionamentos automáticos (`redirect: "error"`).
+- **Content Security Policy (CSP)**: Configurada em `next.config.ts` junto a `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin` e `Cross-Origin-Opener-Policy: same-origin`.
+- **Regras Recomendadas para Proteção da Branch `main` no GitHub**:
+  - Exigir Pull Request com pelo menos 1 aprovação antes do merge.
+  - Exigir aprovação do status check obrigatório `Audit, Secret Scan, Lint, Typecheck, Unit, PostgreSQL RLS, Build & Playwright` (`.github/workflows/ci.yml`).
+  - Bloquear force-pushes e exclusão da branch `main`.

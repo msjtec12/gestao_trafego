@@ -1,45 +1,47 @@
 # Motor de Automações Supervisionadas — Konnexy Ads
 
-## 1. Arquitetura dos 7 Motores
+## 1. Os 7 Motores Independentes (`src/automation/engines/automation-engine.ts`)
 
-O subsistema `src/automation` é composto por 7 motores independentes e testáveis:
-
-1. **Rule Engine**: Avalia condições compostas (`AND` / `OR`) sobre métricas normalizadas (ex.: `CPA > R$ 45,00 AND Gasto >= R$ 150,00 AND Conversões == 0`), respeitando janela temporal (`timeWindowDays`) e volume mínimo de dados (`minImpressions`, `minClicks`, `minSpend`).
-2. **Policy Engine**: Verifica se a campanha ou alteração proposta viola políticas de segurança, limites financeiros máximos da organização (`maxDailyBudgetChangePct`), horário permitido ou restrições de produtos proibidos.
-3. **Risk Engine**: Classifica cada ação proposta em `LOW`, `MEDIUM`, `HIGH` ou `CRITICAL` com base no impacto financeiro percentual, histórico da campanha e reversibilidade.
-4. **Approval Engine**: Determina se a ação exige aprovação humana explícita. No modo padrão (`READ_ONLY`) ou Supervisionado (`SUPERVISED`), **100% das mutações reais exigem aprovação explícita** de um usuário com papel `OWNER`, `ADMIN` ou `TRAFFIC_MANAGER`.
-5. **Simulation Engine**: Calcula uma prévia do efeito esperado antes da execução (ex.: impacto no orçamento mensal e redução projetada de desperdício).
-6. **Execution Engine**: Executa a ação aprovada garantindo:
-   - Verificação do **Botão de Emergência (Kill Switch)**.
-   - Verificação do **Modo de Operação** (bloqueia imediatamente se `READ_ONLY`).
-   - Verificação de **Cooldown** (impede alterações repetidas na mesma campanha dentro da janela mínima, ex.: 6 horas).
-   - Verificação de **Idempotência** (`idempotencyKey` único; bloqueia execuções duplicadas).
-   - **Circuit Breaker**: Abre o circuito automaticamente após falhas consecutivas na API do provedor.
-7. **Audit Engine**: Registra cada transição de estado com timestamp, usuário/sistema responsável, estado anterior, estado proposto e resultado da verificação.
+1. **`RuleEngine`**:
+   - Verifica imediatamente se a regra está ativa (`rule.isEnabled`); regras desativadas nunca são avaliadas.
+   - Resolve métricas dinamicamente para a janela temporal configurada (`rule.timeWindowDays`, ex.: 3, 7, 14 ou 30 dias).
+   - Valida volume estatístico mínimo (`minImpressions`, `minClicks`, `minSpendBrl`) e período de `cooldownMinutes`.
+2. **`PolicyEngine`**:
+   - Valida parâmetros financeiros finitos (`Number.isFinite`), impede reduções inválidas (`<= -100%`), enforces o teto percentual da organização (`maxBudgetChangePct`) e bloqueia categorias de produtos restritos.
+3. **`RiskEngine`**:
+   - Classifica cada ação em `LOW`, `MEDIUM`, `HIGH` ou `CRITICAL`.
+4. **`SimulationEngine`**:
+   - Executa `provider.simulateMutation(request)` validando o isolamento do tenant antes de qualquer aprovação.
+5. **`ApprovalEngine`**:
+   - Valida um objeto `ApprovalRecord` estruturado (correspondência de `organizationId`, `campaignId`, `actionType`, status `APPROVED`, papel RBAC do aprovador com permissão `automation:approve_execution` e data de validade `expiresAt > now`).
+6. **`ExecutionEngine` (`SupervisedExecutionEngine`)**:
+   - Bloqueia imediatamente provedores não simulados na Foundation 1.1 (`!provider.isSimulated`).
+   - Verifica o **Kill Switch Global** e o **Kill Switch por Organização** (`KillSwitchStore`).
+   - Bloqueia execuções em modo **`READ_ONLY`**.
+   - Garante idempotência concorrente (`IdempotencyStore.tryAcquireLock` com estados `IN_FLIGHT` e `COMPLETED`).
+   - Executa **verificação independente pós-execução** (`provider.verifyMutation`) antes de confirmar a transição para `EXECUTED_VERIFIED`.
+   - Controla falhas consecutivas por organização e provedor via `CircuitBreakerStore`.
+7. **`AuditEngine`**:
+   - Registra entradas estruturadas através da porta injetável `AuditLogStore`.
 
 ---
 
-## 2. Fluxo Obrigatório de 9 Etapas
+## 2. Máquina de Estados Explícita (`RecommendationStateMachine`)
 
 ```mermaid
-flowchart LR
-    A["1. Coleta"] --> B["2. Normalização"]
-    B --> C["3. Análise (IA / Regras)"]
-    C --> D["4. Recomendação"]
-    D --> E["5. Validação (Policy & Risk)"]
-    E --> F["6. Aprovação Humana"]
-    F --> G["7. Execução Idempotente"]
-    G --> H["8. Verificação Pós-Execução"]
-    H --> I["9. Auditoria Imutável"]
+stateDiagram-v2
+    [*] --> DRAFT
+    DRAFT --> VALIDATED
+    DRAFT --> REJECTED
+    VALIDATED --> PENDING_APPROVAL
+    VALIDATED --> REJECTED
+    PENDING_APPROVAL --> APPROVED
+    PENDING_APPROVAL --> REJECTED
+    PENDING_APPROVAL --> EXPIRED
+    APPROVED --> EXECUTING
+    APPROVED --> EXPIRED
+    EXECUTING --> VERIFYING
+    EXECUTING --> FAILED
+    VERIFYING --> EXECUTED_VERIFIED
+    VERIFYING --> FAILED
 ```
-
----
-
-## 3. Botão de Emergência (Emergency Kill Switch)
-
-- Disponível permanentemente no topo da aplicação.
-- Quando acionado:
-  1. Altera o estado da organização para `emergencyStopActive = true`.
-  2. Força o modo de operação para `READ_ONLY`.
-  3. Cancela imediatamente todos os `execution_jobs` pendentes.
-  4. Bloqueia qualquer chamada ao `ExecutionEngine.execute()` até que um `OWNER` ou `ADMIN` restaure manualmente a operação e registre justificativa no log de auditoria.

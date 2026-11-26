@@ -1,42 +1,51 @@
 # Arquitetura de Integrações — AdvertisingProvider
 
-## 1. Contrato Independente de Fornecedor
+## 1. Separação entre Contratos de Leitura e Execução
 
-Para evitar acoplamento com SDKs externos, o domínio do Konnexy Ads se comunica exclusivamente através da interface `AdvertisingProvider` (`src/integrations/contracts/advertising-provider.ts`):
+Para garantir o princípio de menor privilégio e impedir que fluxos analíticos ou de IA tenham acesso a métodos de mutação, o Konnexy Ads separa as interfaces em `src/integrations/contracts/advertising-provider.ts`:
 
 ```typescript
-export interface AdvertisingProvider {
+export interface AdvertisingReadProvider {
   readonly providerType: AdProviderType;
   readonly isSimulated: boolean;
-  validateCredentials(accountId: string): Promise<ProviderHealthStatus>;
-  listCampaigns(params: ListCampaignsParams): Promise<PaginatedResult<NormalizedCampaign>>;
-  getDailyMetrics(params: GetMetricsParams): Promise<NormalizedDailyMetric[]>;
-  simulateMutation(mutation: CampaignMutationRequest): Promise<MutationSimulationResult>;
-  executeMutation(mutation: ApprovedCampaignMutation): Promise<MutationExecutionResult>;
+  checkHealth(organizationId: string): Promise<ProviderHealthStatus>;
+  listCampaigns(organizationId: string): Promise<NormalizedCampaign[]>;
+  getDailyMetrics(organizationId: string): Promise<NormalizedDailyMetric[]>;
 }
+
+export interface AdvertisingExecutionProvider {
+  readonly providerType: AdProviderType;
+  readonly isSimulated: boolean;
+  simulateMutation(request: CampaignMutationRequest): Promise<MutationSimulationResult>;
+  executeMutation(request: CampaignMutationRequest): Promise<MutationExecutionResult>;
+  verifyMutation?(
+    request: CampaignMutationRequest,
+    executionResult: MutationExecutionResult
+  ): Promise<PostExecutionVerificationResult>;
+}
+
+export interface AdvertisingProvider
+  extends AdvertisingReadProvider,
+    AdvertisingExecutionProvider {}
 ```
 
 ---
 
-## 2. Provedores Previstos
+## 2. Discriminated Unions e Validação Zod de Mutações
 
-1. **`MockAdsProvider` (Prioridade 1 — Foundation & Testes)**:
-   - Retorna dados determinísticos e realistas de campanhas locais e e-commerce.
-   - Todo payload retornado inclui `isDemoData: true` e `providerType: "MOCK_ADS"`.
-   - Permite simular falhas de rede, rate limits (`429 Too Many Requests`), expiração de token (`401 Unauthorized`) e timeouts para validar a resiliência do motor de automação.
-2. **`GoogleAdsProvider` (Prioridade 1 — Produção)**:
-   - Integração via Google Ads REST API oficial (GAQL — Google Ads Query Language).
-   - Suporte a OAuth 2.0 com renovação automática de `refresh_token`, cabeçalhos `developer-token` e `login-customer-id` (MCC).
-   - Mapeamento de erros específicos (`QuotaError`, `AuthenticationError`, `PolicyViolationError`).
-3. **`MetaAdsProvider` (Fase 2)**:
-   - Integração com Meta Marketing API (Graph API), System User Tokens e Insights API.
-4. **`MicrosoftAdsProvider` (Fase 3)**:
-   - Integração com Microsoft Advertising API (Bing Ads).
+Todas as ações de mutação são validadas pelo schema `DiscriminatedMutationActionSchema`:
+- `PAUSE_CAMPAIGN`: Exige `reason` descritiva (`PauseCampaignPayloadSchema`).
+- `ADJUST_DAILY_BUDGET`: Exige `proposedDailyBudgetBrl` finito e positivo e valida `changePct` finito dentro de `±100%` (`AdjustDailyBudgetPayloadSchema`).
+- `ADD_NEGATIVE_KEYWORD`: Exige lista não vazia de `negativeKeywords` e `matchType` (`EXACT`, `PHRASE`, `BROAD`).
+- `ADJUST_TARGET_CPA`: Exige `proposedTargetCpaBrl` finito e positivo.
 
 ---
 
-## 3. Resiliência e Governança de Chamadas
+## 3. Provedores Previstos
 
-- **Rate Limiting & Retries**: Backoff exponencial com full jitter apenas para erros transitórios (`429`, `502`, `503`, `504`). Erros de validação ou permissão (`400`, `401`, `403`) falham imediatamente sem retry.
-- **Timeouts Estritos**: AbortController configurável (padrão `15000ms` para leitura, `10000ms` para mutação).
-- **Idempotência**: Mutações enviadas ao provedor exigem um `idempotencyKey` único gerado pelo `ApprovalEngine` / `ExecutionEngine`.
+1. **`MockAdsProvider` (Ativo na Foundation 1.1)**:
+   - Retorna dados determinísticos com `isDemoData: true`, incluindo métricas por janela temporal (`metricsByWindowDays` para 3d, 7d, 14d e 30d).
+   - Implementa `verifyMutation` para reconciliação independente pós-execução e suporta simulação de falhas (`RATE_LIMIT_EXCEEDED`, `AUTH_TOKEN_REVOKED`, `PROVIDER_TIMEOUT`, `VERIFICATION_MISMATCH`).
+2. **`GoogleAdsProvider` (Bloqueado por Segurança na Foundation 1.1)**:
+   - Possui `isSimulated = false`. O `ExecutionEngine` bloqueia automaticamente qualquer tentativa de execução em provedores com `isSimulated === false` durante a etapa Foundation (`NON_SIMULATED_PROVIDER_BLOCKED`).
+3. **`MetaAdsProvider` & `MicrosoftAdsProvider` (Fases 3 e 4)**.
