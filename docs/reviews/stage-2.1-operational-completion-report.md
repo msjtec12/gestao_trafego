@@ -3,6 +3,7 @@
 - **Repositório**: `https://github.com/msjtec12/gestao_trafego`
 - **Branch de Entrega**: `fix/stage-2-operational-completion`
 - **Commit Inicial Analisado (HEAD Etapa 2.0)**: `26f8fc97f953ba765e2b3935823e9033fe95ad3a`
+- **Commit de Implementação Principal (Etapa 2.1)**: `0f3754bec073a5e26b6b8a06515ff3152d2cf999`
 - **Modo Operacional Padrão**: `READ_ONLY` (Somente Leitura — zero mutação em campanhas reais)
 
 ---
