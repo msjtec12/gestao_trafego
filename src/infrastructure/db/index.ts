@@ -1,6 +1,13 @@
 import fs from "fs";
-import { neon, Pool } from "@neondatabase/serverless";
+import { neon, neonConfig, Pool } from "@neondatabase/serverless";
+import ws from "ws";
 import { drizzle as drizzleHttp, type NeonHttpDatabase } from "drizzle-orm/neon-http";
+
+// Configure WebSocket constructor for @neondatabase/serverless Pool on Node.js runtimes
+// (Vercel Serverless Node.js 20/22). Ensures deterministic Pool WebSocket transport.
+if (!neonConfig.webSocketConstructor) {
+  neonConfig.webSocketConstructor = ws;
+}
 import {
   drizzle as drizzleServerless,
   type NeonDatabase,
@@ -315,6 +322,70 @@ export async function withAdminPostgresConnection<T>(
 
   const runtime = await getExplicitTestOrDevPglite();
   return await callback(runtime.db as unknown as DrizzleQueryExecutor);
+}
+
+/**
+ * Executes an atomic administrative PostgreSQL transaction (`BEGIN ... COMMIT / ROLLBACK`).
+ * Essential for multi-table onboarding (users -> organizations -> set_config('app.current_organization_id')
+ * -> memberships -> user_sessions -> integrations -> audit_logs) so partial writes NEVER occur
+ * and `set_config(..., true)` applies transaction-locally under `FORCE ROW LEVEL SECURITY`.
+ */
+export async function withAdminPostgresTransaction<T>(
+  callback: (tx: DrizzleQueryExecutor) => Promise<T>,
+  options?: {
+    readonly connectionString?: string;
+    readonly customPg?: PGlite;
+    readonly forceNeonDriver?: boolean;
+    readonly neonPoolFactory?: (connStr: string) => Pool;
+  }
+): Promise<T> {
+  if (options?.customPg) {
+    if (!isExplicitPgliteTestOrDevAllowed(process.env)) {
+      throw new DatabaseConfigurationError(
+        "customPg is not allowed in production."
+      );
+    }
+    const pgliteDb = drizzlePglite(options.customPg, { schema });
+    return await pgliteDb.transaction(async (tx) => {
+      return await callback(tx as unknown as DrizzleQueryExecutor);
+    });
+  }
+
+  const adminUrl =
+    options?.connectionString ??
+    process.env.DATABASE_ADMIN_URL ??
+    process.env.DATABASE_URL;
+
+  const validated = validateRequiredDatabaseUrl({
+    connectionString: adminUrl,
+    allowExplicitPglite: !options?.forceNeonDriver,
+  });
+
+  if (options?.forceNeonDriver || validated.mode === "NEON") {
+    const connStr = validated.connectionString ?? adminUrl ?? "";
+    if (!connStr) {
+      throw new DatabaseConfigurationError(
+        "DATABASE_URL is required for Neon administrative transaction."
+      );
+    }
+    const pool = options?.neonPoolFactory
+      ? options.neonPoolFactory(connStr)
+      : new Pool({ connectionString: connStr });
+    const db = drizzleServerless(pool, { schema });
+
+    try {
+      return await db.transaction(async (tx) => {
+        return await callback(tx);
+      });
+    } finally {
+      await pool.end();
+    }
+  }
+
+  const runtime = await getExplicitTestOrDevPglite();
+  return await runtime.db.transaction(async (tx) => {
+    return await callback(tx as unknown as DrizzleQueryExecutor);
+  });
 }
 
 /**

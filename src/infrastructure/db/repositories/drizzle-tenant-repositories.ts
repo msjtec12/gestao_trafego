@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { and, desc, eq, gte, inArray } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, sql } from "drizzle-orm";
 import type { TenantContext, UserRole } from "@/domain/types";
 import {
   assertAuthenticatedDbContext,
@@ -74,24 +74,36 @@ export interface AggregatedPeriodMetricsResult {
 }
 
 /**
- * Executes secure onboarding of a user, creating their first organization in READ_ONLY mode,
+ * Executes secure, atomic onboarding of a user, creating their first organization in READ_ONLY mode,
  * OWNER membership, persistent user_session, and audit log entry.
+ *
+ * CRITICAL (Neon PostgreSQL 17 + FORCE ROW LEVEL SECURITY):
+ * On Neon PostgreSQL 17, database owners (e.g. `konnexy_ads_owner`) are non-superusers,
+ * so `FORCE ROW LEVEL SECURITY` on `organizations`, `memberships`, `integrations`, and `audit_logs`
+ * is strictly enforced even on administrative connections.
+ * Pre-generating `organizationId` and executing `set_config('app.current_organization_id', organizationId, true)`
+ * inside the transaction ensures `WITH CHECK` and `USING` policies pass cleanly without disabling RLS.
  */
 export async function onboardFirstOrganizationRepository(
   tx: DrizzleQueryExecutor,
   rawInput: OnboardingInput,
-  options?: { readonly nowMs?: number }
+  options?: {
+    readonly nowMs?: number;
+    readonly onStep?: (step: string) => void;
+  }
 ): Promise<{
   readonly user: typeof schema.users.$inferSelect;
   readonly organization: typeof schema.organizations.$inferSelect;
   readonly membership: typeof schema.memberships.$inferSelect;
   readonly sessionToken: string;
 }> {
+  options?.onStep?.("validate_input");
   const input = OnboardingInputSchema.parse(rawInput);
   const nowMs = options?.nowMs ?? Date.now();
   const normalizedEmail = input.email.toLowerCase().trim();
   const normalizedSlug = input.organizationSlug.trim().toLowerCase();
 
+  options?.onStep?.("check_duplicate_email");
   const existingUsers: (typeof schema.users.$inferSelect)[] = await tx
     .select()
     .from(schema.users)
@@ -101,6 +113,7 @@ export async function onboardFirstOrganizationRepository(
     throw new Error("Este e-mail já está cadastrado. Realize o login.");
   }
 
+  options?.onStep?.("check_duplicate_slug");
   const existingOrgs: (typeof schema.organizations.$inferSelect)[] = await tx
     .select()
     .from(schema.organizations)
@@ -112,8 +125,10 @@ export async function onboardFirstOrganizationRepository(
     );
   }
 
+  options?.onStep?.("hash_password");
   const passwordHash = hashPasswordScrypt(input.password);
 
+  options?.onStep?.("insert_user");
   const [createdUser] = await tx
     .insert(schema.users)
     .values({
@@ -125,9 +140,21 @@ export async function onboardFirstOrganizationRepository(
     })
     .returning();
 
+  if (!createdUser) {
+    throw new Error("Falha ao criar usuário no PostgreSQL.");
+  }
+
+  const organizationId = crypto.randomUUID();
+  options?.onStep?.("set_rls_org_context");
+  await tx.execute(
+    sql`SELECT set_config('app.current_organization_id', ${organizationId}, true)`
+  );
+
+  options?.onStep?.("insert_organization");
   const [createdOrg] = await tx
     .insert(schema.organizations)
     .values({
+      id: organizationId,
       name: input.organizationName.trim(),
       slug: normalizedSlug,
       executionMode: "READ_ONLY",
@@ -137,10 +164,11 @@ export async function onboardFirstOrganizationRepository(
     })
     .returning();
 
-  if (!createdUser || !createdOrg) {
-    throw new Error("Falha ao criar usuário ou organização no PostgreSQL.");
+  if (!createdOrg) {
+    throw new Error("Falha ao criar organização no PostgreSQL.");
   }
 
+  options?.onStep?.("insert_owner_membership");
   const [createdMembership] = await tx
     .insert(schema.memberships)
     .values({
@@ -154,6 +182,7 @@ export async function onboardFirstOrganizationRepository(
     throw new Error("Falha ao criar membership OWNER no PostgreSQL.");
   }
 
+  options?.onStep?.("insert_user_session");
   const sessionToken = `ksess_${crypto.randomBytes(32).toString("hex")}`;
   await tx.insert(schema.userSessions).values({
     sessionToken,
@@ -162,6 +191,7 @@ export async function onboardFirstOrganizationRepository(
     expiresAt: new Date(nowMs + 8 * 60 * 60 * 1000),
   });
 
+  options?.onStep?.("insert_audit_log");
   await tx.insert(schema.auditLogs).values({
     organizationId: createdOrg.id,
     actorUserId: createdUser.id,
@@ -226,20 +256,40 @@ export async function authenticateUserWithPostgres(
 
     // If user belongs to an organization, record failed login attempt in audit_logs
     if (user) {
+      let failedLoginOrgId: string | null = null;
       const userMems: (typeof schema.memberships.$inferSelect)[] = await db
         .select()
         .from(schema.memberships)
         .where(eq(schema.memberships.userId, user.id));
-      if (userMems[0]) {
-        await db.insert(schema.auditLogs).values({
-          organizationId: userMems[0].organizationId,
-          actorUserId: user.id,
-          actorType: "USER",
-          action: "AUTH_LOGIN_FAILED",
-          entityType: "user",
-          entityId: user.id,
-          newState: { result: "INVALID_CREDENTIALS" },
-        });
+      failedLoginOrgId = userMems[0]?.organizationId ?? null;
+
+      if (!failedLoginOrgId) {
+        const recentSessions: (typeof schema.userSessions.$inferSelect)[] =
+          await db
+            .select()
+            .from(schema.userSessions)
+            .where(eq(schema.userSessions.userId, user.id))
+            .orderBy(desc(schema.userSessions.createdAt));
+        failedLoginOrgId = recentSessions[0]?.activeOrganizationId ?? null;
+      }
+
+      if (failedLoginOrgId) {
+        try {
+          await db.execute(
+            sql`SELECT set_config('app.current_organization_id', ${failedLoginOrgId}, true)`
+          );
+          await db.insert(schema.auditLogs).values({
+            organizationId: failedLoginOrgId,
+            actorUserId: user.id,
+            actorType: "USER",
+            action: "AUTH_LOGIN_FAILED",
+            entityType: "user",
+            entityId: user.id,
+            newState: { result: "INVALID_CREDENTIALS" },
+          });
+        } catch {
+          // Never mask invalid-credentials error if audit log insertion fails
+        }
       }
     }
 
@@ -248,10 +298,33 @@ export async function authenticateUserWithPostgres(
 
   await rateLimiter.reset(normalizedEmail);
 
-  const userMemberships: (typeof schema.memberships.$inferSelect)[] = await db
+  let userMemberships: (typeof schema.memberships.$inferSelect)[] = await db
     .select()
     .from(schema.memberships)
     .where(eq(schema.memberships.userId, user.id));
+
+  // Under Neon PostgreSQL 17 FORCE ROW LEVEL SECURITY (non-superuser role),
+  // querying `memberships` before setting `app.current_organization_id` returns 0 rows.
+  // Discover the user's most recent active organization from `user_sessions` (no RLS)
+  // and bind transaction-local RLS context before re-reading `memberships`.
+  if (userMemberships.length === 0) {
+    const recentSessions: (typeof schema.userSessions.$inferSelect)[] = await db
+      .select()
+      .from(schema.userSessions)
+      .where(eq(schema.userSessions.userId, user.id))
+      .orderBy(desc(schema.userSessions.createdAt));
+
+    const discoveredOrgId = recentSessions[0]?.activeOrganizationId;
+    if (discoveredOrgId) {
+      await db.execute(
+        sql`SELECT set_config('app.current_organization_id', ${discoveredOrgId}, true)`
+      );
+      userMemberships = await db
+        .select()
+        .from(schema.memberships)
+        .where(eq(schema.memberships.userId, user.id));
+    }
+  }
 
   const primaryMembership = userMemberships[0];
   if (!primaryMembership) {
@@ -259,6 +332,10 @@ export async function authenticateUserWithPostgres(
       "Usuário não possui vínculo com nenhuma organização."
     );
   }
+
+  await db.execute(
+    sql`SELECT set_config('app.current_organization_id', ${primaryMembership.organizationId}, true)`
+  );
 
   const sessionToken = `ksess_${crypto.randomBytes(32).toString("hex")}`;
   await db.insert(schema.userSessions).values({
@@ -333,30 +410,39 @@ export async function resolveSessionFromPostgres(
     throw new UnauthenticatedAccessError("Usuário inativo ou não encontrado.");
   }
 
+  const targetOrgId =
+    params.requestedOrganizationId?.trim() || session.activeOrganizationId;
+
+  // Bind transaction-local RLS context before reading RLS-protected tables
+  // (`memberships`, `organizations`, `member_client_access`) so Neon PG17
+  // non-superuser roles satisfy FORCE ROW LEVEL SECURITY cleanly.
+  await db.execute(
+    sql`SELECT set_config('app.current_organization_id', ${targetOrgId}, true)`
+  );
+
   const allUserMemberships: (typeof schema.memberships.$inferSelect)[] =
     await db
       .select()
       .from(schema.memberships)
       .where(eq(schema.memberships.userId, user.id));
 
-  if (allUserMemberships.length === 0) {
-    throw new UnauthenticatedAccessError(
-      "Usuário sem associação a organizações."
-    );
-  }
-
-  const targetOrgId =
-    params.requestedOrganizationId?.trim() || session.activeOrganizationId;
-
   const activeMembership = allUserMemberships.find(
     (m) => m.organizationId === targetOrgId
   );
 
   if (!activeMembership) {
-    throw new TenantIsolationError(
-      session.activeOrganizationId,
-      targetOrgId,
-      `Usuário autenticado (${user.id}) não possui permissão para acessar a organização (${targetOrgId}).`
+    if (
+      params.requestedOrganizationId?.trim() &&
+      params.requestedOrganizationId.trim() !== session.activeOrganizationId
+    ) {
+      throw new TenantIsolationError(
+        session.activeOrganizationId,
+        targetOrgId,
+        `Usuário autenticado (${user.id}) não possui permissão para acessar a organização (${targetOrgId}).`
+      );
+    }
+    throw new UnauthenticatedAccessError(
+      "Usuário sem associação a organizações."
     );
   }
 
@@ -449,6 +535,10 @@ export async function revokeSessionInPostgres(
     .set({ revokedAt: new Date() })
     .where(eq(schema.userSessions.sessionToken, trimmed));
 
+  await db.execute(
+    sql`SELECT set_config('app.current_organization_id', ${sess.activeOrganizationId}, true)`
+  );
+
   await db.insert(schema.auditLogs).values({
     organizationId: sess.activeOrganizationId,
     actorUserId: sess.userId,
@@ -482,6 +572,10 @@ export async function switchActiveOrganizationInPostgres(
     .update(schema.userSessions)
     .set({ activeOrganizationId: resolved.context.organizationId })
     .where(eq(schema.userSessions.sessionToken, params.sessionToken));
+
+  await db.execute(
+    sql`SELECT set_config('app.current_organization_id', ${resolved.context.organizationId}, true)`
+  );
 
   await db.insert(schema.auditLogs).values({
     organizationId: resolved.context.organizationId,
