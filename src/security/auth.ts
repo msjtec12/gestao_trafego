@@ -1,6 +1,7 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
 import { encode, decode } from "next-auth/jwt";
+import { sql } from "drizzle-orm";
 import { cookies } from "next/headers";
 import { z } from "zod";
 import { withAdminPostgresTransaction } from "@/infrastructure/db";
@@ -77,6 +78,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         }
 
         const authenticated = await withAdminPostgresTransaction(async (tx) => {
+          await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
           return await authenticateUserWithPostgres(tx, {
             email: parsed.data.email,
             password: parsed.data.password,
@@ -220,6 +222,7 @@ export async function resolveUnifiedAuthJsPostgresSession(options?: {
   }
 
   return await withAdminPostgresTransaction(async (tx) => {
+    await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
     return await resolveSessionFromPostgres(tx, {
       sessionToken: dbSessionToken,
       requestedOrganizationId: options?.requestedOrganizationId,
@@ -265,6 +268,7 @@ export async function revokeUnifiedAuthJsSession(): Promise<void> {
 
     if (dbSessionToken.startsWith("ksess_")) {
       await withAdminPostgresTransaction(async (tx) => {
+        await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
         await revokeSessionInPostgres(tx, dbSessionToken);
       });
     }
