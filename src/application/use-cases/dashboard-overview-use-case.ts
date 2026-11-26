@@ -1,12 +1,12 @@
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import type { AdProviderType, UserRole } from "@/domain/types";
-import { getOperationalPostgresRuntime } from "@/infrastructure/db";
+import { withTenantTransaction } from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 import {
   PersistentDrizzleTenantRepository,
-  resolveSessionFromPostgres,
   type AggregatedPeriodMetricsResult,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
+import { resolveUnifiedAuthJsPostgresSession } from "@/security/auth";
 import {
   GoogleAdsProvider,
   MockAdsProvider,
@@ -140,7 +140,8 @@ export interface DashboardOverviewViewModel {
 }
 
 /**
- * Loads the authenticated operational dashboard state strictly from PostgreSQL.
+ * Loads the authenticated operational dashboard state strictly from PostgreSQL
+ * inside an RLS-enforced tenant transaction (`withTenantTransaction`).
  * NEVER falls back to MockAdsProvider or fake demo metrics when no accounts are connected.
  */
 export async function getAuthenticatedOperationalDashboardUseCase(params: {
@@ -149,275 +150,291 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
   readonly adAccountId?: string;
   readonly periodDays?: number;
 }): Promise<DashboardOverviewViewModel> {
-  const { db } = await getOperationalPostgresRuntime();
-  const session = await resolveSessionFromPostgres(db, {
-    sessionToken: params.sessionToken,
+  const session = await resolveUnifiedAuthJsPostgresSession({
+    rawCookieOrToken: params.sessionToken,
   });
 
-  const repo = new PersistentDrizzleTenantRepository(db);
-  const activeOrgRow = await repo.getOrganization(session.context);
-  const clientRows = await repo.listClients(session.context);
-  const accountRows = await repo.listAdAccounts(session.context, {
-    clientId: params.clientId,
-  });
-  const integrationRows = await repo.listPublicIntegrations(session.context);
-  const campaignRows = await repo.listCampaigns(session.context, {
-    clientId: params.clientId,
-    adAccountId: params.adAccountId,
-  });
-  const syncRunRows = await repo.listSyncRuns(session.context);
-  const auditRows = await repo.listAuditLogs(session.context, 25);
+  return await withTenantTransaction(session.context, async (tx) => {
+    const repo = new PersistentDrizzleTenantRepository(tx);
+    const activeOrgRow = await repo.getOrganization(session.context);
+    const clientRows = await repo.listClients(session.context);
+    const accountRows = await repo.listAdAccounts(session.context, {
+      clientId: params.clientId,
+    });
+    const integrationRows = await repo.listPublicIntegrations(session.context);
+    const campaignRows = await repo.listCampaigns(session.context, {
+      clientId: params.clientId,
+      adAccountId: params.adAccountId,
+    });
+    const syncRunRows = await repo.listSyncRuns(session.context);
+    const auditRows = await repo.listAuditLogs(session.context, 25);
 
-  const aggregated = await repo.getAggregatedDashboardMetrics(session.context, {
-    clientId: params.clientId,
-    adAccountId: params.adAccountId,
-    periodDays: params.periodDays ?? 7,
-  });
+    const aggregated = await repo.getAggregatedDashboardMetrics(
+      session.context,
+      {
+        clientId: params.clientId,
+        adAccountId: params.adAccountId,
+        periodDays: params.periodDays ?? 7,
+      }
+    );
 
-  // Load organization memberships + user details
-  const orgMemberships: (typeof schema.memberships.$inferSelect)[] = await db
-    .select()
-    .from(schema.memberships)
-    .where(eq(schema.memberships.organizationId, session.context.organizationId));
-
-  const memberUserIds = orgMemberships.map((m) => m.userId);
-  const userRows: (typeof schema.users.$inferSelect)[] =
-    memberUserIds.length > 0
-      ? await db
-          .select()
-          .from(schema.users)
-          .where(inArray(schema.users.id, memberUserIds))
-      : [];
-
-  const clientAccessRows: (typeof schema.memberClientAccess.$inferSelect)[] =
-    await db
+    // Load organization memberships + user details
+    const orgMemberships: (typeof schema.memberships.$inferSelect)[] = await tx
       .select()
-      .from(schema.memberClientAccess)
+      .from(schema.memberships)
       .where(
-        eq(
-          schema.memberClientAccess.organizationId,
-          session.context.organizationId
-        )
+        eq(schema.memberships.organizationId, session.context.organizationId)
       );
 
-  const clientMap = new Map(clientRows.map((c) => [c.id, c]));
-  const accountMap = new Map(accountRows.map((a) => [a.id, a]));
+    const memberUserIds = orgMemberships.map((m) => m.userId);
+    const userRows: (typeof schema.users.$inferSelect)[] =
+      memberUserIds.length > 0
+        ? await tx
+            .select()
+            .from(schema.users)
+            .where(inArray(schema.users.id, memberUserIds))
+        : [];
 
-  // Map persisted campaigns with their persisted daily_metrics
-  const campaignIds = campaignRows.map((c) => c.id);
-  const persistedDailyMetrics: (typeof schema.dailyMetrics.$inferSelect)[] =
-    campaignIds.length > 0
-      ? await db
-          .select()
-          .from(schema.dailyMetrics)
-          .where(inArray(schema.dailyMetrics.campaignId, campaignIds))
-      : [];
+    const clientAccessRows: (typeof schema.memberClientAccess.$inferSelect)[] =
+      await tx
+        .select()
+        .from(schema.memberClientAccess)
+        .where(
+          eq(
+            schema.memberClientAccess.organizationId,
+            session.context.organizationId
+          )
+        );
 
-  const normalizedCampaigns: NormalizedCampaign[] = campaignRows.map((c) => {
-    const acc = accountMap.get(c.adAccountId);
-    const cli = acc ? clientMap.get(acc.clientId) : undefined;
-    const campMetrics = persistedDailyMetrics.filter(
-      (m) => m.campaignId === c.id
+    const clientMap = new Map(clientRows.map((c) => [c.id, c]));
+    const accountMap = new Map(accountRows.map((a) => [a.id, a]));
+
+    // Map persisted campaigns with their persisted daily_metrics (explicit organization_id filter + RLS)
+    const campaignIds = campaignRows.map((c) => c.id);
+    const persistedDailyMetrics: (typeof schema.dailyMetrics.$inferSelect)[] =
+      campaignIds.length > 0
+        ? await tx
+            .select()
+            .from(schema.dailyMetrics)
+            .where(
+              and(
+                eq(
+                  schema.dailyMetrics.organizationId,
+                  session.context.organizationId
+                ),
+                inArray(schema.dailyMetrics.campaignId, campaignIds)
+              )
+            )
+        : [];
+
+    const normalizedCampaigns: NormalizedCampaign[] = campaignRows.map((c) => {
+      const acc = accountMap.get(c.adAccountId);
+      const cli = acc ? clientMap.get(acc.clientId) : undefined;
+      const campMetrics = persistedDailyMetrics.filter(
+        (m) => m.campaignId === c.id
+      );
+
+      const spendCents = campMetrics.reduce(
+        (sum, m) => sum + Number(m.costCents),
+        0
+      );
+      const conversions = campMetrics.reduce(
+        (sum, m) => sum + Number(m.conversions),
+        0
+      );
+      const convValueCents = campMetrics.reduce(
+        (sum, m) => sum + Number(m.conversionValueCents),
+        0
+      );
+      const impressions = campMetrics.reduce(
+        (sum, m) => sum + Number(m.impressions),
+        0
+      );
+      const clicks = campMetrics.reduce((sum, m) => sum + Number(m.clicks), 0);
+
+      const spendBrl = Number((spendCents / 100).toFixed(2));
+      const cpaBrl =
+        conversions > 0 ? Number((spendBrl / conversions).toFixed(2)) : 0;
+      const roas =
+        spendCents > 0 ? Number((convValueCents / spendCents).toFixed(2)) : 0;
+      const ctrPct =
+        impressions > 0 ? Number(((clicks / impressions) * 100).toFixed(2)) : 0;
+
+      return {
+        id: c.id,
+        organizationId: c.organizationId,
+        clientId: acc?.clientId,
+        externalCampaignId: c.externalCampaignId,
+        clientName: cli?.name ?? "Cliente Associado",
+        name: c.name,
+        provider: c.provider,
+        channelType:
+          (c.channelType as NormalizedCampaign["channelType"]) ?? "SEARCH",
+        status: c.status,
+        biddingStrategy: c.biddingStrategy,
+        dailyBudgetBrl: Number((Number(c.dailyBudgetCents) / 100).toFixed(2)),
+        spend7dBrl: spendBrl,
+        conversions7d: conversions,
+        cpa7dBrl: cpaBrl,
+        roas7d: roas,
+        ctr7dPct: ctrPct,
+        impressions7d: impressions,
+        clicks7d: clicks,
+        isDemoData: c.isDemoData,
+        lastAutomatedChangeAt: c.lastAutomatedChangeAt
+          ? c.lastAutomatedChangeAt.toISOString()
+          : null,
+      };
+    });
+
+    const hasLiveGoogleCredentials = Boolean(
+      process.env.GOOGLE_ADS_CLIENT_ID &&
+        !process.env.GOOGLE_ADS_CLIENT_ID.startsWith("replace_with_")
     );
 
-    const spendCents = campMetrics.reduce(
-      (sum, m) => sum + Number(m.costCents),
-      0
+    const integrationsVm: IntegrationHealthViewModel[] = integrationRows.map(
+      (intg) => ({
+        id: intg.id,
+        organizationId: intg.organizationId,
+        provider: intg.provider,
+        label: intg.externalAccountLabel,
+        status:
+          intg.status === "REVOKED"
+            ? "REVOKED"
+            : intg.status === "CONNECTED"
+              ? "CONNECTED"
+              : intg.isDemoIntegration
+                ? "SANDBOX_DEMO"
+                : hasLiveGoogleCredentials
+                  ? intg.status
+                  : "BLOCKED_MISSING_CREDENTIALS",
+        mode: "READ_ONLY",
+        managerCustomerId: intg.managerCustomerId,
+        lastSyncedAtIso: intg.lastSyncedAt
+          ? intg.lastSyncedAt.toISOString()
+          : null,
+        lastCheckpoint: intg.lastCheckpointToken ?? null,
+        latencyMs: 0,
+        message:
+          intg.status === "REVOKED"
+            ? "Credenciais revogadas e removidas do Credential Vault."
+            : intg.status === "CONNECTED"
+              ? "Integração OAuth 2.0 ativa no PostgreSQL Credential Vault (AES-256-GCM + AAD)."
+              : "Bloqueado de forma transparente: GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_CLIENT_SECRET não configurados com credenciais oficiais. Nenhuma conexão falsa é simulada.",
+        isDemoData: intg.isDemoIntegration,
+      })
     );
-    const conversions = campMetrics.reduce(
-      (sum, m) => sum + Number(m.conversions),
-      0
-    );
-    const convValueCents = campMetrics.reduce(
-      (sum, m) => sum + Number(m.conversionValueCents),
-      0
-    );
-    const impressions = campMetrics.reduce(
-      (sum, m) => sum + Number(m.impressions),
-      0
-    );
-    const clicks = campMetrics.reduce((sum, m) => sum + Number(m.clicks), 0);
 
-    const spendBrl = Number((spendCents / 100).toFixed(2));
-    const cpaBrl =
-      conversions > 0 ? Number((spendBrl / conversions).toFixed(2)) : 0;
-    const roas =
-      spendCents > 0 ? Number((convValueCents / spendCents).toFixed(2)) : 0;
-    const ctrPct =
-      impressions > 0 ? Number(((clicks / impressions) * 100).toFixed(2)) : 0;
+    const organizationsVm: OrganizationOption[] =
+      session.availableOrganizations.map((org) => ({
+        id: org.id,
+        name: org.name,
+        slug: org.slug,
+        executionMode: "READ_ONLY",
+        timezone: activeOrgRow.timezone,
+        currencyCode: activeOrgRow.currencyCode,
+        maxDailyBudgetChangePct: activeOrgRow.maxDailyBudgetChangePct,
+        minCooldownMinutes: activeOrgRow.minCooldownMinutes,
+        emergencyStopActive: activeOrgRow.emergencyStopActive,
+        isDemo: false,
+      }));
 
-    return {
+    const clientsVm: ClientRecordViewModel[] = clientRows.map((c) => ({
       id: c.id,
       organizationId: c.organizationId,
-      clientId: acc?.clientId,
-      externalCampaignId: c.externalCampaignId,
-      clientName: cli?.name ?? "Cliente Associado",
       name: c.name,
-      provider: c.provider,
-      channelType:
-        (c.channelType as NormalizedCampaign["channelType"]) ?? "SEARCH",
-      status: c.status,
-      biddingStrategy: c.biddingStrategy,
-      dailyBudgetBrl: Number((Number(c.dailyBudgetCents) / 100).toFixed(2)),
-      spend7dBrl: spendBrl,
-      conversions7d: conversions,
-      cpa7dBrl: cpaBrl,
-      roas7d: roas,
-      ctr7dPct: ctrPct,
-      impressions7d: impressions,
-      clicks7d: clicks,
-      isDemoData: c.isDemoData,
-      lastAutomatedChangeAt: c.lastAutomatedChangeAt
-        ? c.lastAutomatedChangeAt.toISOString()
+      industry: c.industry,
+      monthlyBudgetCapBrl: Number(
+        (Number(c.monthlyBudgetCapCents) / 100).toFixed(2)
+      ),
+      targetCpaBrl: c.targetCpaCents
+        ? Number((c.targetCpaCents / 100).toFixed(2))
         : null,
-    };
-  });
-
-  const hasLiveGoogleCredentials = Boolean(
-    process.env.GOOGLE_ADS_CLIENT_ID &&
-      !process.env.GOOGLE_ADS_CLIENT_ID.startsWith("replace_with_")
-  );
-
-  const integrationsVm: IntegrationHealthViewModel[] = integrationRows.map(
-    (intg) => ({
-      id: intg.id,
-      organizationId: intg.organizationId,
-      provider: intg.provider,
-      label: intg.externalAccountLabel,
-      status:
-        intg.status === "REVOKED"
-          ? "REVOKED"
-          : intg.status === "CONNECTED"
-            ? "CONNECTED"
-            : intg.isDemoIntegration
-              ? "SANDBOX_DEMO"
-              : hasLiveGoogleCredentials
-                ? intg.status
-                : "BLOCKED_MISSING_CREDENTIALS",
-      mode: "READ_ONLY",
-      managerCustomerId: intg.managerCustomerId,
-      lastSyncedAtIso: intg.lastSyncedAt
-        ? intg.lastSyncedAt.toISOString()
-        : null,
-      lastCheckpoint: intg.lastCheckpointToken ?? null,
-      latencyMs: 0,
-      message:
-        intg.status === "REVOKED"
-          ? "Credenciais revogadas e removidas do Credential Vault."
-          : intg.status === "CONNECTED"
-            ? "Integração OAuth 2.0 ativa no PostgreSQL Credential Vault (AES-256-GCM + AAD)."
-            : "Bloqueado de forma transparente: GOOGLE_ADS_CLIENT_ID / GOOGLE_ADS_CLIENT_SECRET não configurados com credenciais oficiais. Nenhuma conexão falsa é simulada.",
-      isDemoData: intg.isDemoIntegration,
-    })
-  );
-
-  const organizationsVm: OrganizationOption[] =
-    session.availableOrganizations.map((org) => ({
-      id: org.id,
-      name: org.name,
-      slug: org.slug,
-      executionMode: "READ_ONLY",
-      timezone: activeOrgRow.timezone,
-      currencyCode: activeOrgRow.currencyCode,
-      maxDailyBudgetChangePct: activeOrgRow.maxDailyBudgetChangePct,
-      minCooldownMinutes: activeOrgRow.minCooldownMinutes,
-      emergencyStopActive: activeOrgRow.emergencyStopActive,
-      isDemo: false,
+      targetRoas: c.targetRoas ? Number(c.targetRoas) : null,
+      isActive: c.isActive,
+      isDemoData: false,
     }));
 
-  const clientsVm: ClientRecordViewModel[] = clientRows.map((c) => ({
-    id: c.id,
-    organizationId: c.organizationId,
-    name: c.name,
-    industry: c.industry,
-    monthlyBudgetCapBrl: Number((Number(c.monthlyBudgetCapCents) / 100).toFixed(2)),
-    targetCpaBrl: c.targetCpaCents
-      ? Number((c.targetCpaCents / 100).toFixed(2))
-      : null,
-    targetRoas: c.targetRoas ? Number(c.targetRoas) : null,
-    isActive: c.isActive,
-    isDemoData: false,
-  }));
+    const adAccountsVm: AdAccountRecordViewModel[] = accountRows.map((a) => ({
+      id: a.id,
+      organizationId: a.organizationId,
+      clientId: a.clientId,
+      clientName: clientMap.get(a.clientId)?.name ?? "Cliente",
+      provider: a.provider,
+      externalAccountId: a.externalAccountId,
+      managerCustomerId: a.managerCustomerId,
+      isMccAccount: a.isMccAccount,
+      isSelectedForSync: a.isSelectedForSync,
+      name: a.name,
+      currencyCode: a.currencyCode,
+      timezone: a.timezone,
+      isDemoData: a.isDemoData,
+    }));
 
-  const adAccountsVm: AdAccountRecordViewModel[] = accountRows.map((a) => ({
-    id: a.id,
-    organizationId: a.organizationId,
-    clientId: a.clientId,
-    clientName: clientMap.get(a.clientId)?.name ?? "Cliente",
-    provider: a.provider,
-    externalAccountId: a.externalAccountId,
-    managerCustomerId: a.managerCustomerId,
-    isMccAccount: a.isMccAccount,
-    isSelectedForSync: a.isSelectedForSync,
-    name: a.name,
-    currencyCode: a.currencyCode,
-    timezone: a.timezone,
-    isDemoData: a.isDemoData,
-  }));
+    const membersVm: MemberRecordViewModel[] = orgMemberships.map((m) => {
+      const u = userRows.find((usr) => usr.id === m.userId);
+      const assignedClients = clientAccessRows
+        .filter((ca) => ca.membershipId === m.id)
+        .map((ca) => ca.clientId);
+      return {
+        id: m.id,
+        organizationId: m.organizationId,
+        userId: m.userId,
+        fullName: u?.fullName ?? "Usuário",
+        email: u?.email ?? "",
+        role: m.role,
+        allowedClientIds:
+          m.role === "CLIENT_VIEWER"
+            ? assignedClients
+            : clientsVm.map((c) => c.id),
+      };
+    });
 
-  const membersVm: MemberRecordViewModel[] = orgMemberships.map((m) => {
-    const u = userRows.find((usr) => usr.id === m.userId);
-    const assignedClients = clientAccessRows
-      .filter((ca) => ca.membershipId === m.id)
-      .map((ca) => ca.clientId);
+    const syncHistoryVm: SyncRunViewModel[] = syncRunRows.map((sr) => ({
+      id: sr.id,
+      integrationId: sr.integrationId,
+      provider: sr.provider,
+      status: sr.status,
+      checkpointToken: sr.checkpointToken,
+      entitiesSynced: sr.entitiesSynced,
+      startedAtIso: sr.startedAt.toISOString(),
+      completedAtIso: sr.completedAt ? sr.completedAt.toISOString() : null,
+      errorCode: sr.errorCode,
+    }));
+
+    const auditTrailVm: AuditEventViewModel[] = auditRows.map((ar) => ({
+      id: ar.id,
+      timestamp: ar.createdAt.toISOString().slice(0, 19).replace("T", " "),
+      action: ar.action,
+      entityType: ar.entityType,
+      entityId: ar.entityId,
+      detail: JSON.stringify(ar.newState ?? {}),
+    }));
+
     return {
-      id: m.id,
-      organizationId: m.organizationId,
-      userId: m.userId,
-      fullName: u?.fullName ?? "Usuário",
-      email: u?.email ?? "",
-      role: m.role,
-      allowedClientIds:
-        m.role === "CLIENT_VIEWER"
-          ? assignedClients
-          : clientsVm.map((c) => c.id),
+      organizationName: activeOrgRow.name,
+      organizationId: activeOrgRow.id,
+      authenticatedUserEmail: session.user.email,
+      authenticatedUserName: session.user.fullName,
+      authenticatedUserRole: session.context.role,
+      defaultExecutionMode: "READ_ONLY",
+      isDemoEnvironment: false,
+      isServerKillSwitchPersisted: true,
+      emergencyStopActive: activeOrgRow.emergencyStopActive,
+      organizations: organizationsVm,
+      clients: clientsVm,
+      adAccounts: adAccountsVm,
+      members: membersVm,
+      integrations: integrationsVm,
+      campaigns: normalizedCampaigns,
+      dailyMetrics: [...aggregated.timeline],
+      aggregatedMetrics: aggregated,
+      syncHistory: syncHistoryVm,
+      auditTrail: auditTrailVm,
+      recommendations: [],
+      domainTables: ALL_DOMAIN_TABLES,
     };
   });
-
-  const syncHistoryVm: SyncRunViewModel[] = syncRunRows.map((sr) => ({
-    id: sr.id,
-    integrationId: sr.integrationId,
-    provider: sr.provider,
-    status: sr.status,
-    checkpointToken: sr.checkpointToken,
-    entitiesSynced: sr.entitiesSynced,
-    startedAtIso: sr.startedAt.toISOString(),
-    completedAtIso: sr.completedAt ? sr.completedAt.toISOString() : null,
-    errorCode: sr.errorCode,
-  }));
-
-  const auditTrailVm: AuditEventViewModel[] = auditRows.map((ar) => ({
-    id: ar.id,
-    timestamp: ar.createdAt.toISOString().slice(0, 19).replace("T", " "),
-    action: ar.action,
-    entityType: ar.entityType,
-    entityId: ar.entityId,
-    detail: JSON.stringify(ar.newState ?? {}),
-  }));
-
-  return {
-    organizationName: activeOrgRow.name,
-    organizationId: activeOrgRow.id,
-    authenticatedUserEmail: session.user.email,
-    authenticatedUserName: session.user.fullName,
-    authenticatedUserRole: session.context.role,
-    defaultExecutionMode: "READ_ONLY",
-    isDemoEnvironment: false,
-    isServerKillSwitchPersisted: true,
-    emergencyStopActive: activeOrgRow.emergencyStopActive,
-    organizations: organizationsVm,
-    clients: clientsVm,
-    adAccounts: adAccountsVm,
-    members: membersVm,
-    integrations: integrationsVm,
-    campaigns: normalizedCampaigns,
-    dailyMetrics: [...aggregated.timeline],
-    aggregatedMetrics: aggregated,
-    syncHistory: syncHistoryVm,
-    auditTrail: auditTrailVm,
-    recommendations: [],
-    domainTables: ALL_DOMAIN_TABLES,
-  };
 }
 
 /**

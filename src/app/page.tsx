@@ -2,13 +2,15 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { getAuthenticatedOperationalDashboardUseCase } from "@/application/use-cases/dashboard-overview-use-case";
 import { DashboardShell } from "@/components/dashboard/dashboard-shell";
-import { SESSION_COOKIE_NAME } from "@/middleware";
+import { AUTHJS_SESSION_COOKIE_NAME } from "@/middleware";
 
 export const dynamic = "force-dynamic";
 
 export default async function HomePage() {
   const cookieStore = await cookies();
-  const sessionToken = cookieStore.get(SESSION_COOKIE_NAME)?.value;
+  const sessionToken =
+    cookieStore.get(AUTHJS_SESSION_COOKIE_NAME)?.value ??
+    cookieStore.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value;
 
   if (!sessionToken) {
     redirect("/login");

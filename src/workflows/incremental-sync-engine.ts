@@ -1,11 +1,15 @@
 import { and, desc, eq } from "drizzle-orm";
 import type { AdProviderType, TenantContext } from "@/domain/types";
-import { assertAuthenticatedDbContext } from "@/infrastructure/db";
+import {
+  assertAuthenticatedDbContext,
+  type DrizzleQueryExecutor,
+} from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 import { assertTenantAccess } from "@/security/rbac-and-tenant";
 import { convertGoogleAdsMicrosToCents } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
 
 export interface SyncEntityCounts {
+  readonly [key: string]: number;
   readonly adAccounts: number;
   readonly campaigns: number;
   readonly adGroups: number;
@@ -161,8 +165,7 @@ export const SCHEDULED_GOOGLE_ADS_SYNC_JOB = {
  * - Records audit events (`SYNC_STARTED`, `SYNC_COMPLETED`, `SYNC_FAILED`).
  */
 export class PersistentPostgresAdsSyncEngine {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  constructor(private readonly db: any) {}
+  constructor(private readonly db: DrizzleQueryExecutor) {}
 
   /**
    * Recovers any stale `RUNNING` sync jobs after an unexpected process crash/restart.
@@ -297,6 +300,10 @@ export class PersistentPostgresAdsSyncEngine {
         })
         .returning();
 
+      if (!skipped) {
+        throw new Error("Falha ao registrar sync_run SKIPPED_CONCURRENT_LOCK.");
+      }
+
       return skipped;
     }
 
@@ -314,6 +321,10 @@ export class PersistentPostgresAdsSyncEngine {
         startedAt: new Date(),
       })
       .returning();
+
+    if (!runningJob) {
+      throw new Error("Falha ao criar job de sincronização RUNNING.");
+    }
 
     await this.db.insert(schema.auditLogs).values({
       organizationId: authCtx.organizationId,
@@ -364,7 +375,9 @@ export class PersistentPostgresAdsSyncEngine {
             })
             .where(eq(schema.adAccounts.id, existingAcc[0].id))
             .returning();
-          primaryAdAccountId = primaryAdAccountId ?? upd.id;
+          if (upd) {
+            primaryAdAccountId = primaryAdAccountId ?? upd.id;
+          }
         } else {
           const [ins] = await this.db
             .insert(schema.adAccounts)
@@ -383,7 +396,9 @@ export class PersistentPostgresAdsSyncEngine {
               isDemoData: batch.isDemoData,
             })
             .returning();
-          primaryAdAccountId = primaryAdAccountId ?? ins.id;
+          if (ins) {
+            primaryAdAccountId = primaryAdAccountId ?? ins.id;
+          }
         }
       }
 
@@ -441,7 +456,9 @@ export class PersistentPostgresAdsSyncEngine {
             })
             .where(eq(schema.campaigns.id, existingCamp[0].id))
             .returning();
-          campaignIdByExternalId.set(camp.externalCampaignId, upd.id);
+          if (upd) {
+            campaignIdByExternalId.set(camp.externalCampaignId, upd.id);
+          }
         } else {
           const [ins] = await this.db
             .insert(schema.campaigns)
@@ -458,7 +475,9 @@ export class PersistentPostgresAdsSyncEngine {
               isDemoData: batch.isDemoData,
             })
             .returning();
-          campaignIdByExternalId.set(camp.externalCampaignId, ins.id);
+          if (ins) {
+            campaignIdByExternalId.set(camp.externalCampaignId, ins.id);
+          }
         }
       }
 
@@ -500,7 +519,9 @@ export class PersistentPostgresAdsSyncEngine {
             })
             .where(eq(schema.adGroups.id, existingAg[0].id))
             .returning();
-          adGroupIdByExternalId.set(ag.externalAdGroupId, upd.id);
+          if (upd) {
+            adGroupIdByExternalId.set(ag.externalAdGroupId, upd.id);
+          }
         } else {
           const [ins] = await this.db
             .insert(schema.adGroups)
@@ -512,7 +533,9 @@ export class PersistentPostgresAdsSyncEngine {
               defaultCpcBidCents,
             })
             .returning();
-          adGroupIdByExternalId.set(ag.externalAdGroupId, ins.id);
+          if (ins) {
+            adGroupIdByExternalId.set(ag.externalAdGroupId, ins.id);
+          }
         }
       }
 
@@ -856,6 +879,10 @@ export class PersistentPostgresAdsSyncEngine {
         })
         .where(eq(schema.syncRuns.id, runningJob.id))
         .returning();
+
+      if (!completedJob) {
+        throw new Error("Falha ao concluir sync_run COMPLETED.");
+      }
 
       await this.db.insert(schema.auditLogs).values({
         organizationId: authCtx.organizationId,

@@ -39,3 +39,16 @@ src/
 ├── workflows/            # Durable Scheduled & Event Workflows
 └── modules/              # Vertical Feature Modules (organizations, campaigns, ai-insights, etc.)
 ```
+
+## Git Governance — Branch Protection
+
+- A branch main é protegida por GitHub Rulesets.
+- É proibido realizar push diretamente na main.
+- Toda implementação deve ocorrer em branches feat/*, fix/* ou chore/*.
+- Toda entrega deve possuir um Pull Request.
+- Todos os checks obrigatórios do GitHub Actions devem ser aprovados.
+- O agente não possui autorização para realizar merge.
+- A aprovação do CI não substitui a auditoria técnica independente.
+- Somente o proprietário do projeto poderá autorizar o merge após a revisão.
+- É proibido desativar, contornar ou modificar as regras de proteção para concluir uma tarefa.
+

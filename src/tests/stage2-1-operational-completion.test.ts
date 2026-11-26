@@ -2,11 +2,13 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
+import type { Pool } from "@neondatabase/serverless";
 import { eq } from "drizzle-orm";
 import * as schema from "@/infrastructure/db/schema";
 import {
   applyAllMigrationsToPglite,
   withTenantTransaction,
+  type DrizzleQueryExecutor,
 } from "@/infrastructure/db";
 import {
   authenticateUserWithPostgres,
@@ -32,13 +34,12 @@ const STATE_SECRET = "stage2-1-oauth-state-hmac-secret-key-32bytes";
 
 describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth, OAuth Vault, SSRF & 9-Domain Sync", () => {
   let pg: PGlite;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let db: any;
+  let db: DrizzleQueryExecutor;
 
   beforeAll(async () => {
     pg = new PGlite();
     await applyAllMigrationsToPglite(pg);
-    db = drizzle(pg, { schema });
+    db = drizzle(pg, { schema }) as unknown as DrizzleQueryExecutor;
   });
 
   afterAll(async () => {
@@ -188,13 +189,13 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
       .insert(schema.memberships)
       .values({
         organizationId: orgA.organization.id,
-        userId: viewerUser.id,
+        userId: viewerUser!.id,
         role: "CLIENT_VIEWER",
       })
       .returning();
 
     await repo.assignClientToViewer(sessA.context, {
-      membershipId: viewerMembership.id,
+      membershipId: viewerMembership!.id,
       clientId: clientA1.id,
     });
 
@@ -214,7 +215,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
     // CLIENT_VIEWER cannot escalate permissions or create clients
     await expect(
       repo.updateMemberRole(viewerLogin.context, {
-        membershipId: viewerMembership.id,
+        membershipId: viewerMembership!.id,
         newRole: "OWNER",
       })
     ).rejects.toThrow(PermissionDeniedError);
@@ -315,8 +316,8 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
       .from(schema.integrations)
       .where(eq(schema.integrations.id, connected.id));
 
-    expect(rawDbIntegration.encryptedAccessToken?.startsWith("v1:")).toBe(true);
-    expect(rawDbIntegration.encryptedAccessToken).not.toContain(
+    expect(rawDbIntegration?.encryptedAccessToken?.startsWith("v1:")).toBe(true);
+    expect(rawDbIntegration?.encryptedAccessToken).not.toContain(
       "ya29.initial_persisted_access_token"
     );
 
@@ -464,6 +465,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
       })
       .returning();
 
+    const integrationId = integration!.id;
     const syncEngine = new PersistentPostgresAdsSyncEngine(db);
 
     const buildBatch = (checkpoint: string, day1CostMicros: number) => ({
@@ -569,7 +571,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
 
     const firstRun = await syncEngine.executePersistentSync({
       context: sess.context,
-      integrationId: integration.id,
+      integrationId,
       clientId: client.id,
       provider: "GOOGLE_ADS",
       fetchBatchFn: async () => buildBatch("ckpt-v1", 200_000_000),
@@ -581,7 +583,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
     // Re-run idempotently with updated metric cost (reconciliation from R$ 200 to R$ 204)
     const secondRun = await syncEngine.executePersistentSync({
       context: sess.context,
-      integrationId: integration.id,
+      integrationId,
       clientId: client.id,
       provider: "GOOGLE_ADS",
       fetchBatchFn: async (prevCkpt) => {
@@ -662,7 +664,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
     // Simulate a stale RUNNING sync job left behind by a crash and verify durable lock + recovery
     await db.insert(schema.syncRuns).values({
       organizationId: orgFilter,
-      integrationId: integration.id,
+      integrationId,
       provider: "GOOGLE_ADS",
       status: "RUNNING",
       checkpointToken: "ckpt-stale",
@@ -670,7 +672,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
 
     const lockedAttempt = await syncEngine.executePersistentSync({
       context: sess.context,
-      integrationId: integration.id,
+      integrationId,
       clientId: client.id,
       provider: "GOOGLE_ADS",
       fetchBatchFn: async () => buildBatch("ckpt-v3", 204_000_000),
@@ -679,7 +681,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
 
     const recoveredCount = await syncEngine.recoverStaleRunningSyncs(
       sess.context,
-      integration.id
+      integrationId
     );
     expect(recoveredCount).toBe(1);
   });
@@ -736,8 +738,7 @@ describe("Stage 2.1 Operational Completion — Full PostgreSQL Persistence, Auth
         connectionString:
           "postgresql://neondb_owner:secret@ep-konnexy-pooler.sa-east-1.aws.neon.tech/konnexy_ads?sslmode=require",
         forceNeonDriver: true,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        neonPoolFactory: () => mockNeonPool as any,
+        neonPoolFactory: () => mockNeonPool as unknown as Pool,
       }
     );
 

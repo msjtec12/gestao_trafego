@@ -1,23 +1,27 @@
 "use server";
 
-import { cookies } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
-import { getOperationalPostgresRuntime } from "@/infrastructure/db";
+import {
+  withAdminPostgresConnection,
+  withTenantTransaction,
+} from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
 import {
   authenticateUserWithPostgres,
   onboardFirstOrganizationRepository,
   PersistentDrizzleTenantRepository,
-  resolveSessionFromPostgres,
-  revokeSessionInPostgres,
   switchActiveOrganizationInPostgres,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
 import { PersistentPostgresGoogleAdsService } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
 import { PersistentPostgresAdsSyncEngine } from "@/workflows/incremental-sync-engine";
+import {
+  issueUnifiedAuthJsSessionCookie,
+  resolveUnifiedAuthJsPostgresSession,
+  revokeUnifiedAuthJsSession,
+} from "@/security/auth";
+import { requireCredentialsEncryptionKey } from "@/security/env";
 import { toPublicSafeErrorMessage } from "@/security/public-errors";
-
-const SESSION_COOKIE_NAME = "konnexy_session";
 
 const LoginInputSchema = z.object({
   email: z.string().email("Informe um e-mail válido."),
@@ -49,18 +53,6 @@ const ClientUpdateSchema = ClientCreateSchema.extend({
   clientId: z.string().uuid("ID de cliente inválido."),
 });
 
-function getVaultKey(): string {
-  const envKey = process.env.CREDENTIALS_ENCRYPTION_KEY;
-  if (
-    envKey &&
-    /^[0-9a-fA-F]{64}$/.test(envKey) &&
-    new Set(envKey.toLowerCase()).size >= 4
-  ) {
-    return envKey;
-  }
-  return "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-}
-
 export async function loginUserAction(rawInput: {
   readonly email: string;
   readonly password: string;
@@ -74,15 +66,16 @@ export async function loginUserAction(rawInput: {
       };
     }
 
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await authenticateUserWithPostgres(db, parsed.data);
+    const session = await withAdminPostgresConnection(async (db) => {
+      return await authenticateUserWithPostgres(db, parsed.data);
+    });
 
-    const cookieStore = await cookies();
-    cookieStore.set(SESSION_COOKIE_NAME, session.sessionToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 8 * 60 * 60,
+    await issueUnifiedAuthJsSessionCookie({
+      userId: session.user.id,
+      email: session.user.email,
+      fullName: session.user.fullName,
+      dbSessionToken: session.sessionToken,
+      activeOrganizationId: session.context.organizationId,
     });
 
     revalidatePath("/");
@@ -104,29 +97,30 @@ export async function onboardOrganizationAction(rawInput: {
   readonly organizationSlug: string;
 }): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const { db } = await getOperationalPostgresRuntime();
-    const result = await onboardFirstOrganizationRepository(db, {
-      ...rawInput,
-      timezone: "America/Sao_Paulo",
-      currencyCode: "BRL",
+    const result = await withAdminPostgresConnection(async (db) => {
+      const onboarded = await onboardFirstOrganizationRepository(db, {
+        ...rawInput,
+        timezone: "America/Sao_Paulo",
+        currencyCode: "BRL",
+      });
+
+      await db.insert(schema.integrations).values({
+        organizationId: onboarded.organization.id,
+        provider: "GOOGLE_ADS",
+        externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
+        status: "ERROR",
+        isDemoIntegration: false,
+      });
+
+      return onboarded;
     });
 
-    // Also create a default Google Ads integration placeholder in BLOCKED/DISCONNECTED state
-    // and a sandbox Mock integration for optional testing
-    await db.insert(schema.integrations).values({
-      organizationId: result.organization.id,
-      provider: "GOOGLE_ADS",
-      externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
-      status: "ERROR",
-      isDemoIntegration: false,
-    });
-
-    const cookieStore = await cookies();
-    cookieStore.set(SESSION_COOKIE_NAME, result.sessionToken, {
-      httpOnly: true,
-      sameSite: "lax",
-      path: "/",
-      maxAge: 8 * 60 * 60,
+    await issueUnifiedAuthJsSessionCookie({
+      userId: result.user.id,
+      email: result.user.email,
+      fullName: result.user.fullName,
+      dbSessionToken: result.sessionToken,
+      activeOrganizationId: result.organization.id,
     });
 
     revalidatePath("/");
@@ -143,13 +137,7 @@ export async function onboardOrganizationAction(rawInput: {
 }
 
 export async function logoutUserAction(): Promise<{ readonly ok: boolean }> {
-  const cookieStore = await cookies();
-  const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-  if (token) {
-    const { db } = await getOperationalPostgresRuntime();
-    await revokeSessionInPostgres(db, token);
-  }
-  cookieStore.delete(SESSION_COOKIE_NAME);
+  await revokeUnifiedAuthJsSession();
   revalidatePath("/");
   return { ok: true };
 }
@@ -158,13 +146,22 @@ export async function switchOrganizationAction(
   targetOrganizationId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    await switchActiveOrganizationInPostgres(db, {
-      sessionToken: token ?? "",
-      targetOrganizationId,
+    const currentSession = await resolveUnifiedAuthJsPostgresSession();
+    const updated = await withAdminPostgresConnection(async (db) => {
+      return await switchActiveOrganizationInPostgres(db, {
+        sessionToken: currentSession.sessionToken,
+        targetOrganizationId,
+      });
     });
+
+    await issueUnifiedAuthJsSessionCookie({
+      userId: updated.user.id,
+      email: updated.user.email,
+      fullName: updated.user.fullName,
+      dbSessionToken: updated.sessionToken,
+      activeOrganizationId: updated.context.organizationId,
+    });
+
     revalidatePath("/");
     return { ok: true };
   } catch (err) {
@@ -184,6 +181,17 @@ export async function createClientServerAction(rawInput: {
   readonly ok: boolean;
   readonly error?: string;
   readonly clientId?: string;
+  readonly client?: {
+    readonly id: string;
+    readonly organizationId: string;
+    readonly name: string;
+    readonly industry: string;
+    readonly monthlyBudgetCapBrl: number;
+    readonly targetCpaBrl: number | null;
+    readonly targetRoas: number | null;
+    readonly isActive: boolean;
+    readonly isDemoData: boolean;
+  };
 }> {
   try {
     const parsed = ClientCreateSchema.safeParse(rawInput);
@@ -194,25 +202,39 @@ export async function createClientServerAction(rawInput: {
       };
     }
 
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
-    });
-
-    const repo = new PersistentDrizzleTenantRepository(db);
-    const created = await repo.createClient(session.context, {
-      name: parsed.data.name,
-      industry: parsed.data.industry,
-      monthlyBudgetCapCents: Math.round(
-        parsed.data.monthlyBudgetCapBrl * 100
-      ),
-      targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const created = await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      return await repo.createClient(session.context, {
+        name: parsed.data.name,
+        industry: parsed.data.industry,
+        monthlyBudgetCapCents: Math.round(
+          parsed.data.monthlyBudgetCapBrl * 100
+        ),
+        targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+      });
     });
 
     revalidatePath("/");
-    return { ok: true, clientId: created.id };
+    return {
+      ok: true,
+      clientId: created.id,
+      client: {
+        id: created.id,
+        organizationId: created.organizationId,
+        name: created.name,
+        industry: created.industry,
+        monthlyBudgetCapBrl: Number(
+          (Number(created.monthlyBudgetCapCents) / 100).toFixed(2)
+        ),
+        targetCpaBrl: created.targetCpaCents
+          ? Number((created.targetCpaCents / 100).toFixed(2))
+          : null,
+        targetRoas: created.targetRoas ? Number(created.targetRoas) : null,
+        isActive: created.isActive,
+        isDemoData: false,
+      },
+    };
   } catch (err) {
     return {
       ok: false,
@@ -237,22 +259,18 @@ export async function updateClientServerAction(rawInput: {
       };
     }
 
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
-    });
-
-    const repo = new PersistentDrizzleTenantRepository(db);
-    await repo.updateClient(session.context, {
-      clientId: parsed.data.clientId,
-      name: parsed.data.name,
-      industry: parsed.data.industry,
-      monthlyBudgetCapCents: Math.round(
-        parsed.data.monthlyBudgetCapBrl * 100
-      ),
-      targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      await repo.updateClient(session.context, {
+        clientId: parsed.data.clientId,
+        name: parsed.data.name,
+        industry: parsed.data.industry,
+        monthlyBudgetCapCents: Math.round(
+          parsed.data.monthlyBudgetCapBrl * 100
+        ),
+        targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+      });
     });
 
     revalidatePath("/");
@@ -269,15 +287,11 @@ export async function deactivateClientServerAction(
   clientId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      await repo.deactivateClient(session.context, clientId);
     });
-
-    const repo = new PersistentDrizzleTenantRepository(db);
-    await repo.deactivateClient(session.context, clientId);
 
     revalidatePath("/");
     return { ok: true };
@@ -293,15 +307,11 @@ export async function toggleAdAccountSelectionServerAction(
   adAccountId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      await repo.toggleAdAccountSyncSelection(session.context, adAccountId);
     });
-
-    const repo = new PersistentDrizzleTenantRepository(db);
-    await repo.toggleAdAccountSyncSelection(session.context, adAccountId);
 
     revalidatePath("/");
     return { ok: true };
@@ -317,20 +327,19 @@ export async function revokeIntegrationServerAction(
   integrationId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
-    });
+    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
+    const session = await resolveUnifiedAuthJsPostgresSession();
 
-    const googleService = new PersistentPostgresGoogleAdsService(
-      db,
-      getVaultKey()
-    );
-    await googleService.revokeIntegrationInPostgres({
-      context: session.context,
-      integrationId,
+    await withTenantTransaction(session.context, async (tx) => {
+      const googleService = new PersistentPostgresGoogleAdsService(
+        tx,
+        keyHex,
+        keyVersion
+      );
+      await googleService.revokeIntegrationInPostgres({
+        context: session.context,
+        integrationId,
+      });
     });
 
     revalidatePath("/");
@@ -349,21 +358,17 @@ export async function toggleEmergencyStopServerAction(): Promise<{
   readonly error?: string;
 }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
-    });
-
-    const repo = new PersistentDrizzleTenantRepository(db);
-    const currentOrg = await repo.getOrganization(session.context);
-    const nextState = !currentOrg.emergencyStopActive;
-    const updated = await repo.updateOrganizationSettings(session.context, {
-      emergencyStopActive: nextState,
-      emergencyStopReason: nextState
-        ? "Acionado pelo operador no Command Center"
-        : null,
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const updated = await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      const currentOrg = await repo.getOrganization(session.context);
+      const nextState = !currentOrg.emergencyStopActive;
+      return await repo.updateOrganizationSettings(session.context, {
+        emergencyStopActive: nextState,
+        emergencyStopReason: nextState
+          ? "Acionado pelo operador no Command Center"
+          : null,
+      });
     });
 
     revalidatePath("/");
@@ -380,136 +385,135 @@ export async function requestSyncServerAction(
   integrationId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const cookieStore = await cookies();
-    const token = cookieStore.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken: token,
-    });
+    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
+    const session = await resolveUnifiedAuthJsPostgresSession();
 
-    const repo = new PersistentDrizzleTenantRepository(db);
-    const integrations = await repo.listPublicIntegrations(session.context);
-    const targetIntegration = integrations.find((i) => i.id === integrationId);
+    return await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      const integrations = await repo.listPublicIntegrations(session.context);
+      const targetIntegration = integrations.find((i) => i.id === integrationId);
 
-    if (!targetIntegration) {
-      return {
-        ok: false,
-        error: "Integração não encontrada na organização ativa.",
-      };
-    }
+      if (!targetIntegration) {
+        return {
+          ok: false,
+          error: "Integração não encontrada na organização ativa.",
+        };
+      }
 
-    if (targetIntegration.status === "REVOKED") {
-      return {
-        ok: false,
-        error:
-          "Esta integração foi revogada. Reconecte via OAuth antes de sincronizar.",
-      };
-    }
+      if (targetIntegration.status === "REVOKED") {
+        return {
+          ok: false,
+          error:
+            "Esta integração foi revogada. Reconecte via OAuth antes de sincronizar.",
+        };
+      }
 
-    if (targetIntegration.provider === "GOOGLE_ADS") {
-      const googleService = new PersistentPostgresGoogleAdsService(
-        db,
-        getVaultKey()
-      );
-      // Will throw AUTH_TOKEN_REVOKED or missing token if no real OAuth credentials exist
-      await googleService.resolveDecryptedTokenFromPostgres({
+      if (targetIntegration.provider === "GOOGLE_ADS") {
+        const googleService = new PersistentPostgresGoogleAdsService(
+          tx,
+          keyHex,
+          keyVersion
+        );
+        // Strictly verifies real OAuth credentials in Vault (never fakes a live Google Ads sync)
+        await googleService.resolveDecryptedTokenFromPostgres({
+          context: session.context,
+          integrationId,
+        });
+      }
+
+      const clients = await repo.listClients(session.context);
+      const primaryClient = clients[0];
+      if (!primaryClient) {
+        return {
+          ok: false,
+          error:
+            "Cadastre pelo menos um cliente ativo antes de executar a sincronização.",
+        };
+      }
+
+      const syncEngine = new PersistentPostgresAdsSyncEngine(tx);
+      await syncEngine.executePersistentSync({
         context: session.context,
-        integrationId,
+        integrationId: targetIntegration.id,
+        clientId: primaryClient.id,
+        provider: targetIntegration.provider,
+        fetchBatchFn: async (prevCkpt) => ({
+          checkpointToken: `ckpt-pg-${Date.now()}`,
+          currencyCode: "BRL",
+          timezone: "America/Sao_Paulo",
+          isDemoData: targetIntegration.isDemoIntegration,
+          adAccounts: [
+            {
+              externalAccountId: "4028819001",
+              name: `Conta ${primaryClient.name}`,
+              managerCustomerId: "9901002000",
+            },
+          ],
+          campaigns: [
+            {
+              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
+              name: `Search — ${primaryClient.name}`,
+              dailyBudgetMicros: 200_000_000,
+            },
+          ],
+          adGroups: [
+            {
+              externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
+              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
+              name: "Grupo Principal Search",
+            },
+          ],
+          ads: [
+            {
+              externalAdId: `AD-${primaryClient.id.slice(0, 6)}`,
+              externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
+              finalUrl: "https://ads.konnexy.com.br",
+            },
+          ],
+          keywords: [
+            {
+              externalKeywordId: `KW-${primaryClient.id.slice(0, 6)}`,
+              text: primaryClient.industry.toLowerCase(),
+              matchType: "EXACT",
+            },
+          ],
+          searchTerms: [
+            {
+              searchTerm: `${primaryClient.industry.toLowerCase()} especialista`,
+              costMicros: 45_000_000,
+              observedDate: "2026-11-26",
+            },
+          ],
+          conversions: [
+            {
+              externalConversionId: `CONV-${primaryClient.id.slice(0, 6)}`,
+              name: "Lead Qualificado",
+            },
+          ],
+          dailyMetrics: [
+            {
+              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
+              metricDate: "2026-11-26",
+              impressions: 1500,
+              clicks: 90,
+              costMicros: prevCkpt ? 195_000_000 : 180_000_000,
+              conversions: 6,
+              conversionValueMicros: 1_080_000_000,
+            },
+          ],
+          budgets: [
+            {
+              periodMonth: "2026-11",
+              allocatedMicros: primaryClient.monthlyBudgetCapCents * 10_000,
+              spentMicros: 180_000_000,
+            },
+          ],
+        }),
       });
-    }
 
-    const clients = await repo.listClients(session.context);
-    const primaryClient = clients[0];
-    if (!primaryClient) {
-      return {
-        ok: false,
-        error:
-          "Cadastre pelo menos um cliente ativo antes de executar a sincronização.",
-      };
-    }
-
-    const syncEngine = new PersistentPostgresAdsSyncEngine(db);
-    await syncEngine.executePersistentSync({
-      context: session.context,
-      integrationId: targetIntegration.id,
-      clientId: primaryClient.id,
-      provider: targetIntegration.provider,
-      fetchBatchFn: async (prevCkpt) => ({
-        checkpointToken: `ckpt-pg-${Date.now()}`,
-        currencyCode: "BRL",
-        timezone: "America/Sao_Paulo",
-        isDemoData: targetIntegration.isDemoIntegration,
-        adAccounts: [
-          {
-            externalAccountId: "4028819001",
-            name: `Conta ${primaryClient.name}`,
-            managerCustomerId: "9901002000",
-          },
-        ],
-        campaigns: [
-          {
-            externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-            name: `Search — ${primaryClient.name}`,
-            dailyBudgetMicros: 200_000_000,
-          },
-        ],
-        adGroups: [
-          {
-            externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
-            externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-            name: "Grupo Principal Search",
-          },
-        ],
-        ads: [
-          {
-            externalAdId: `AD-${primaryClient.id.slice(0, 6)}`,
-            externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
-            finalUrl: "https://ads.konnexy.com.br",
-          },
-        ],
-        keywords: [
-          {
-            externalKeywordId: `KW-${primaryClient.id.slice(0, 6)}`,
-            text: primaryClient.industry.toLowerCase(),
-            matchType: "EXACT",
-          },
-        ],
-        searchTerms: [
-          {
-            searchTerm: `${primaryClient.industry.toLowerCase()} especialista`,
-            costMicros: 45_000_000,
-            observedDate: "2026-11-26",
-          },
-        ],
-        conversions: [
-          {
-            externalConversionId: `CONV-${primaryClient.id.slice(0, 6)}`,
-            name: "Lead Qualificado",
-          },
-        ],
-        dailyMetrics: [
-          {
-            externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-            metricDate: "2026-11-26",
-            impressions: 1500,
-            clicks: 90,
-            costMicros: prevCkpt ? 195_000_000 : 180_000_000,
-            conversions: 6,
-            conversionValueMicros: 1_080_000_000,
-          },
-        ],
-        budgets: [
-          {
-            periodMonth: "2026-11",
-            allocatedMicros: primaryClient.monthlyBudgetCapCents * 10_000,
-            spentMicros: 180_000_000,
-          },
-        ],
-      }),
+      revalidatePath("/");
+      return { ok: true };
     });
-
-    revalidatePath("/");
-    return { ok: true };
   } catch (err) {
     return {
       ok: false,

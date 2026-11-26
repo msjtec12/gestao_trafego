@@ -5,6 +5,7 @@ import { drizzle } from "drizzle-orm/pglite";
 import fs from "fs";
 import path from "path";
 import * as schema from "@/infrastructure/db/schema";
+import type { DrizzleQueryExecutor } from "@/infrastructure/db";
 import {
   onboardFirstOrganizationRepository,
   PersistentDrizzleTenantRepository,
@@ -178,7 +179,7 @@ describe("PostgreSQL Real Disposable DB Integration — RLS, Composite FKs, Tabl
   });
 
   it("executes persistent Drizzle onboarding and tenant-scoped queries with CLIENT_VIEWER filtering", async () => {
-    const db = drizzle(pg, { schema });
+    const db = drizzle(pg, { schema }) as unknown as DrizzleQueryExecutor;
     const repo = new PersistentDrizzleTenantRepository(db);
 
     const onboarded = await onboardFirstOrganizationRepository(db, {

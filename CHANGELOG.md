@@ -5,6 +5,23 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
+## [0.2.2] - 2026-11-26 — Stage 2.2: Production Readiness Hardening
+
+### Segurança & Arquitetura (P0 / P1 / P2)
+- **Runtime PostgreSQL com Neon Obrigatório em Produção (Zero PGlite Fallback)**:
+  - Substituição de `getOperationalPostgresRuntime()` por `withAdminPostgresConnection` e `withTenantTransaction` fortemente tipados (`DrizzleQueryExecutor`, zero `any` e zero `eslint-disable` em `src/`).
+  - Bloqueio incondicional de PGlite em produção e na Vercel (`VERCEL=1`), lançando `DatabaseConfigurationError` caso `DATABASE_URL` não aponte para um cluster Neon válido.
+- **Eliminação Total de Fallbacks de Secrets**:
+  - Remoção de chaves AES fixas e segredos de assinatura OAuth de fallback em todo o código da aplicação.
+  - Validação fail-closed centralizada em `src/security/env.ts` (`requireCredentialsEncryptionKey`, `requireAuthSecret`, `requireOAuthStateSigningSecret`, `requireGoogleAdsOAuthConfig`).
+- **Unificação de Autenticação em Auth.js v5**:
+  - Consolidação em uma única arquitetura oficial (`src/security/auth.ts`) emitindo o cookie oficial `authjs.session-token` vinculado à tabela PostgreSQL `user_sessions` (com revogação imediata no logout e expiração verificada no servidor).
+  - Remoção de `ADMIN_BOOTSTRAP_EMAIL` e `ADMIN_BOOTSTRAP_PASSWORD_HASH`.
+- **Estabilidade Playwright E2E (`--retries=0`) e Acessibilidade WCAG AA (`@axe-core/playwright`)**:
+  - Adição de `@custom-variant dark (&:where(.dark, .dark *));` em `src/app/globals.css` e ajustes de contraste e atributos ARIA (`aria-controls`, `role="tabpanel"`).
+  - Verificação automatizada de zero violações `critical` e `serious` do Axe em `/login`, `/onboarding`, `/`, `/demo` e `CommandPalette`.
+  - Suíte dedicada `src/tests/neon-driver-integration.test.ts` (`pnpm test:neon`) e separação das etapas no GitHub Actions CI.
+
 ## [0.2.1] - 2026-11-26 — Stage 2.1: Operational Completion
 
 ### Adicionado & Persistido em PostgreSQL

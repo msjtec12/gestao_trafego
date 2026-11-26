@@ -1,28 +1,22 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { getOperationalPostgresRuntime } from "@/infrastructure/db";
-import { resolveSessionFromPostgres } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
+import { withTenantTransaction } from "@/infrastructure/db";
 import { PersistentPostgresGoogleAdsService } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
-import { SESSION_COOKIE_NAME } from "@/middleware";
+import { AUTHJS_SESSION_COOKIE_NAME } from "@/middleware";
+import { resolveUnifiedAuthJsPostgresSession } from "@/security/auth";
+import {
+  requireCredentialsEncryptionKey,
+  requireGoogleAdsOAuthConfig,
+} from "@/security/env";
 import { toPublicSafeErrorMessage } from "@/security/public-errors";
-
-function getVaultKey(): string {
-  const envKey = process.env.CREDENTIALS_ENCRYPTION_KEY;
-  if (
-    envKey &&
-    /^[0-9a-fA-F]{64}$/.test(envKey) &&
-    new Set(envKey.toLowerCase()).size >= 4
-  ) {
-    return envKey;
-  }
-  return "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
-}
 
 export async function GET(request: NextRequest) {
   try {
-    const sessionToken = request.cookies.get(SESSION_COOKIE_NAME)?.value;
-    const { db } = await getOperationalPostgresRuntime();
-    const session = await resolveSessionFromPostgres(db, {
-      sessionToken,
+    const rawCookie =
+      request.cookies.get(AUTHJS_SESSION_COOKIE_NAME)?.value ??
+      request.cookies.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value;
+
+    const session = await resolveUnifiedAuthJsPostgresSession({
+      rawCookieOrToken: rawCookie,
     });
 
     const signedState = request.nextUrl.searchParams.get("state") ?? "";
@@ -39,22 +33,28 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const clientId = process.env.GOOGLE_ADS_CLIENT_ID ?? "";
-    const clientSecret = process.env.GOOGLE_ADS_CLIENT_SECRET ?? "";
-    const stateSecret =
-      process.env.AUTH_SECRET ??
-      "konnexy-ads-default-state-signing-secret-32chars";
+    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
+    const oauthConfig = requireGoogleAdsOAuthConfig();
 
-    const service = new PersistentPostgresGoogleAdsService(db, getVaultKey());
-    const integration = await service.exchangeCodeAndPersistIntegration({
-      context: session.context,
-      signedState,
-      authorizationCode: code,
-      clientId,
-      clientSecret,
-      stateSigningSecret: stateSecret,
-      externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
-    });
+    const integration = await withTenantTransaction(
+      session.context,
+      async (tx) => {
+        const service = new PersistentPostgresGoogleAdsService(
+          tx,
+          keyHex,
+          keyVersion
+        );
+        return await service.exchangeCodeAndPersistIntegration({
+          context: session.context,
+          signedState,
+          authorizationCode: code,
+          clientId: oauthConfig.clientId,
+          clientSecret: oauthConfig.clientSecret,
+          stateSigningSecret: oauthConfig.stateSigningSecret,
+          externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
+        });
+      }
+    );
 
     return NextResponse.json(
       {

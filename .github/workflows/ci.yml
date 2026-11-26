@@ -6,6 +6,7 @@ on:
       - main
       - "feat/**"
       - "fix/**"
+      - "chore/**"
       - "foundation/**"
   pull_request:
     branches:
@@ -27,9 +28,15 @@ jobs:
     env:
       NODE_ENV: test
       NEXT_PUBLIC_APP_NAME: "Konnexy Ads"
-      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3100"
       NEXT_PUBLIC_DEFAULT_EXECUTION_MODE: "READ_ONLY"
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/konnexy_ads_test"
+      KONNEXY_ALLOW_PGLITE_DEV: "true"
+      KONNEXY_PG_DATA_DIR: "memory://"
+      AUTH_SECRET: "ci-fixture-auth-secret-high-entropy-key-32bytes-min"
+      CREDENTIALS_ENCRYPTION_KEY: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+      CREDENTIALS_ENCRYPTION_KEY_VERSION: "v1"
+      OAUTH_STATE_SIGNING_SECRET: "ci-fixture-oauth-state-signing-hmac-secret-32bytes"
 
     steps:
       - name: Checkout repository
@@ -60,23 +67,29 @@ jobs:
       - name: 1. Install dependencies (frozen lockfile)
         run: pnpm install --frozen-lockfile
 
-      - name: 2. Security Audit (Block on High or Critical vulnerabilities)
+      - name: 2. Dependency Security Audit (Block on High or Critical vulnerabilities)
         run: pnpm audit --audit-level=high
 
-      - name: 3. Run ESLint
+      - name: 3. Run ESLint (Zero warnings)
         run: pnpm lint
 
       - name: 4. Run TypeScript Strict Typecheck
         run: pnpm typecheck
 
-      - name: 5. Run Unit & Disposable PostgreSQL RLS Integration Tests
-        run: pnpm test
+      - name: 5. Run Unit Tests
+        run: pnpm test:unit
 
-      - name: 6. Build Next.js Production Application
+      - name: 6. Run Disposable PGlite PostgreSQL RLS & Operational Persistence Integration Tests
+        run: pnpm test:pglite
+
+      - name: 7. Run Neon Driver & Production Guard Integration Tests
+        run: pnpm test:neon
+
+      - name: 8. Build Next.js Production Application
         run: pnpm build
 
-      - name: 7. Install Playwright Chromium Browser
+      - name: 9. Install Playwright Chromium Browser
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: 8. Run Playwright E2E & Multi-Viewport Accessibility Tests
+      - name: 10. Run Playwright E2E, Multi-Viewport & Axe Accessibility Tests
         run: pnpm test:e2e

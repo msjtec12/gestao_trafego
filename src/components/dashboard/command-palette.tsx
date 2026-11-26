@@ -91,14 +91,18 @@ export function CommandPalette({
     >
       <div className="w-full max-w-xl rounded-xl border border-slate-700/80 bg-[#0b1629] text-slate-100 shadow-2xl overflow-hidden">
         <div className="flex items-center border-b border-slate-800 px-4 py-3">
-          <Search className="h-4 w-4 text-cyan-400 mr-3 shrink-0" />
+          <Search
+            className="h-4 w-4 text-cyan-400 mr-3 shrink-0"
+            aria-hidden="true"
+          />
           <input
             type="text"
             autoFocus
+            aria-label="Buscar comandos, campanhas, módulos ou ações de governança"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Buscar comandos, campanhas, módulos ou ações de governança..."
-            className="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-400 focus:outline-none"
+            className="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-300 focus:outline-none"
           />
           <button
             type="button"
