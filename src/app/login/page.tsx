@@ -133,6 +133,28 @@ export default function LoginPage() {
               </Button>
             </form>
 
+            <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-3 py-2 text-[11px] text-slate-700 dark:text-slate-300 space-y-1">
+              <div className="flex items-center justify-between">
+                <span className="font-semibold text-cyan-600 dark:text-cyan-300">
+                  Credencial Inicial de Bootstrap (OWNER):
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEmail("admin@konnexy.com.br");
+                    setPassword("Konnexy#2026");
+                  }}
+                  className="text-[11px] font-medium text-cyan-600 dark:text-cyan-400 underline cursor-pointer"
+                >
+                  Preencher automaticamente
+                </button>
+              </div>
+              <p className="font-mono text-[11px]">
+                Login: <strong>admin@konnexy.com.br</strong> | Senha:{" "}
+                <strong>Konnexy#2026</strong>
+              </p>
+            </div>
+
             <div className="pt-3 border-t border-slate-200 dark:border-slate-800 flex flex-col gap-2 text-xs text-center">
               <Link
                 href="/onboarding"
