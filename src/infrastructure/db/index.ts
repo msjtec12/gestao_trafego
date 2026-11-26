@@ -2,6 +2,8 @@ import { neon, Pool } from "@neondatabase/serverless";
 import { drizzle as drizzleHttp } from "drizzle-orm/neon-http";
 import { drizzle as drizzleServerless } from "drizzle-orm/neon-serverless";
 import { sql } from "drizzle-orm";
+import type { TenantContext } from "@/domain/types";
+import { UnauthenticatedAccessError } from "@/security/session-guard";
 import * as schema from "./schema";
 
 const UUID_V4_REGEX =
@@ -13,6 +15,18 @@ export function assertValidOrganizationUuid(organizationId: string): void {
       `Invalid organization_id UUID format for RLS context: '${organizationId}'.`
     );
   }
+}
+
+export function assertAuthenticatedDbContext(
+  context: TenantContext | null | undefined
+): TenantContext {
+  if (!context || !context.userId?.trim() || !context.organizationId?.trim()) {
+    throw new UnauthenticatedAccessError(
+      "Database access denied: authenticated TenantContext with valid userId and organizationId is mandatory."
+    );
+  }
+  assertValidOrganizationUuid(context.organizationId);
+  return context;
 }
 
 export function createDbClient(connectionString?: string) {
@@ -29,13 +43,12 @@ export function createDbClient(connectionString?: string) {
 export type DatabaseClient = ReturnType<typeof createDbClient>;
 
 /**
- * Executes a callback inside an explicit PostgreSQL transaction with
- * `SET LOCAL app.current_organization_id = <organizationId>` and
- * `SET LOCAL ROLE konnexy_app` so that Neon Connection Pooler (PgBouncer)
- * cannot leak tenant context across pooled requests.
+ * Executes a callback inside an explicit PostgreSQL transaction protected by an
+ * authenticated TenantContext (`SET LOCAL ROLE konnexy_app` +
+ * `SELECT set_config('app.current_organization_id', context.organizationId, true)`).
  */
 export async function withTenantTransaction<T>(
-  organizationId: string,
+  contextOrOrgId: TenantContext | string,
   callback: (
     tx: Parameters<
       Parameters<ReturnType<typeof drizzleServerless>["transaction"]>[0]
@@ -43,6 +56,11 @@ export async function withTenantTransaction<T>(
   ) => Promise<T>,
   connectionString?: string
 ): Promise<T> {
+  const organizationId =
+    typeof contextOrOrgId === "string"
+      ? contextOrOrgId
+      : assertAuthenticatedDbContext(contextOrOrgId).organizationId;
+
   assertValidOrganizationUuid(organizationId);
   const url = connectionString ?? process.env.DATABASE_URL;
   if (!url) {

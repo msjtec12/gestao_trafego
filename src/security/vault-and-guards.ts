@@ -6,7 +6,7 @@ const SENSITIVE_KEYS_REGEX =
   /^(password|secret|token|access_?token|refresh_?token|client_?secret|api_?key|authorization|developer_?token|encrypted_?.*|cookie|session_?token|private_?key|webhook_?secret)$/i;
 
 const INLINE_BEARER_OR_KEY_REGEX =
-  /(Bearer\s+[A-Za-z0-9\-._~+/]+=*|sk-[A-Za-z0-9]{16,}|ya29\.[A-Za-z0-9\-_]+)/gi;
+  /(Bearer\s+[A-Za-z0-9\-._~+/]+=*|sk-[A-Za-z0-9]{16,}|ya29\.[A-Za-z0-9\-_]+|1\/\/0[A-Za-z0-9\-_]+|postgresql:\/\/[^\s"']+)/gi;
 
 export function redactSensitiveData<T>(
   payload: T,
@@ -49,6 +49,88 @@ export function redactSensitiveData<T>(
   return payload;
 }
 
+/**
+ * Sanitizes errors before returning to HTTP clients or UI so internal SQL,
+ * file paths, database connection strings, or stack traces are never exposed.
+ */
+export function toPublicSafeErrorMessage(
+  error: unknown,
+  fallbackMessage = "Não foi possível concluir a operação. Tente novamente ou contate o administrador."
+): { readonly publicMessage: string; readonly errorCode: string } {
+  if (!error || typeof error !== "object") {
+    return { publicMessage: fallbackMessage, errorCode: "INTERNAL_ERROR" };
+  }
+
+  const errObj = error as {
+    name?: string;
+    code?: string;
+    errorCode?: string;
+    message?: string;
+  };
+  const code = errObj.errorCode ?? errObj.code ?? errObj.name ?? "INTERNAL_ERROR";
+  const rawMessage = typeof errObj.message === "string" ? errObj.message : "";
+
+  const internalLeakPatterns = [
+    /postgresql:\/\//i,
+    /select\s+.*\s+from\s+/i,
+    /insert\s+into\s+/i,
+    /c:\\users\\/i,
+    /\/home\//i,
+    /node_modules/i,
+    /at\s+[A-Za-z0-9_.]+\s+\(/i,
+    /ECONNREFUSED|ENOTFOUND|ETIMEDOUT/i,
+  ];
+
+  if (
+    !rawMessage ||
+    internalLeakPatterns.some((pattern) => pattern.test(rawMessage))
+  ) {
+    return {
+      publicMessage: fallbackMessage,
+      errorCode: String(code),
+    };
+  }
+
+  return {
+    publicMessage: redactSensitiveData(rawMessage),
+    errorCode: String(code),
+  };
+}
+
+/**
+ * Canonical JSON serialization and SHA-256 hashing to bind an ApprovalRecord
+ * to the immutable action content (organizationId + campaignId + actionType + payload).
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalizeJson(v)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  const sortedKeys = Object.keys(record).sort();
+  const entries = sortedKeys.map(
+    (k) => `${JSON.stringify(k)}:${canonicalizeJson(record[k])}`
+  );
+  return `{${entries.join(",")}}`;
+}
+
+export function computeActionPayloadHash(params: {
+  readonly organizationId: string;
+  readonly campaignId: string;
+  readonly actionType: string;
+  readonly payload: Record<string, unknown>;
+}): string {
+  const canonical = canonicalizeJson({
+    organizationId: params.organizationId.trim(),
+    campaignId: params.campaignId.trim(),
+    actionType: params.actionType.trim(),
+    payload: params.payload,
+  });
+  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
 export interface CredentialAadContext {
   readonly organizationId: string;
   readonly integrationId: string;
@@ -84,10 +166,6 @@ function buildAadBuffer(aad?: CredentialAadContext): Buffer | null {
   );
 }
 
-/**
- * Encrypts OAuth credentials with AES-256-GCM, key versioning (v1:iv:tag:cipher),
- * high-entropy key validation, and optional tenant+integration AAD binding.
- */
 export function encryptCredential(
   plainText: string,
   hexKey64OrKeyRing: string | KeyRing,
@@ -126,6 +204,41 @@ export function encryptCredential(
   const authTag = cipher.getAuthTag();
 
   return `${version}:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+/**
+ * Mandatory AAD wrapper for Stage 2 OAuth Credential Vault.
+ */
+export function encryptVaultCredentialWithMandatoryAad(params: {
+  readonly plainText: string;
+  readonly keyRing: string | KeyRing;
+  readonly keyVersion?: string;
+  readonly aad: CredentialAadContext;
+}): string {
+  if (!params.aad?.organizationId?.trim() || !params.aad?.integrationId?.trim()) {
+    throw new Error(
+      "Vault AAD (organizationId and integrationId) is mandatory for OAuth token encryption."
+    );
+  }
+  return encryptCredential(params.plainText, params.keyRing, {
+    keyVersion: params.keyVersion ?? "v1",
+    aad: params.aad,
+  });
+}
+
+export function decryptVaultCredentialWithMandatoryAad(params: {
+  readonly cipherPayload: string;
+  readonly keyRing: string | KeyRing;
+  readonly aad: CredentialAadContext;
+}): string {
+  if (!params.aad?.organizationId?.trim() || !params.aad?.integrationId?.trim()) {
+    throw new Error(
+      "Vault AAD (organizationId and integrationId) is mandatory for OAuth token decryption."
+    );
+  }
+  return decryptCredential(params.cipherPayload, params.keyRing, {
+    aad: params.aad,
+  });
 }
 
 export function decryptCredential(
@@ -246,6 +359,12 @@ export function validateSafeExternalUrl(rawUrl: string): URL {
     throw new Error("SSRF Guard: Embedded URL credentials are not permitted.");
   }
 
+  if (parsed.port && parsed.port !== "443") {
+    throw new Error(
+      `SSRF Guard: Non-standard HTTPS port '${parsed.port}' is blocked.`
+    );
+  }
+
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const forbiddenHostPatterns = [
     /^localhost$/,
@@ -278,8 +397,18 @@ const defaultDnsResolver: DnsResolverFn = async (hostname: string) => {
   return await dns.lookup(hostname, { all: true, verbatim: true });
 };
 
+export interface SafePinnedHttpTransportContext {
+  readonly url: URL;
+  readonly hostname: string;
+  readonly pinnedAddress: string;
+  readonly resolvedAddresses: readonly string[];
+  readonly safeFetchInit: RequestInit;
+}
+
 /**
- * Full async SSRF guard with DNS resolution validation and safe redirect inspection.
+ * Full async SSRF guard with DNS resolution validation, pinned IP transport context
+ * (preventing DNS rebinding TOCTOU between lookup and HTTP socket connect), and
+ * safe redirect inspection.
  */
 export async function resolveAndValidateSafeExternalUrl(
   rawUrl: string,
@@ -287,12 +416,9 @@ export async function resolveAndValidateSafeExternalUrl(
     readonly dnsResolver?: DnsResolverFn;
     readonly redirectChainUrls?: readonly string[];
     readonly maxRedirects?: number;
+    readonly timeoutMs?: number;
   }
-): Promise<{
-  readonly url: URL;
-  readonly resolvedAddresses: readonly string[];
-  readonly safeFetchInit: RequestInit;
-}> {
+): Promise<SafePinnedHttpTransportContext> {
   const maxRedirects = options?.maxRedirects ?? 3;
   const redirectChain = options?.redirectChainUrls ?? [];
 
@@ -312,8 +438,16 @@ export async function resolveAndValidateSafeExternalUrl(
   if (net.isIP(host) !== 0) {
     return {
       url: parsed,
+      hostname: host,
+      pinnedAddress: host,
       resolvedAddresses: [host],
-      safeFetchInit: { redirect: "error" },
+      safeFetchInit: {
+        redirect: "error",
+        headers: {
+          Host: host,
+          "X-Pinned-Remote-Address": host,
+        },
+      },
     };
   }
 
@@ -321,7 +455,9 @@ export async function resolveAndValidateSafeExternalUrl(
   const records = await resolver(host);
 
   if (!records || records.length === 0) {
-    throw new Error(`SSRF Guard: DNS resolution returned no records for '${host}'.`);
+    throw new Error(
+      `SSRF Guard: DNS resolution returned no records for '${host}'.`
+    );
   }
 
   const addresses: string[] = [];
@@ -334,9 +470,19 @@ export async function resolveAndValidateSafeExternalUrl(
     addresses.push(rec.address);
   }
 
+  const pinnedAddress = addresses[0]!;
+
   return {
     url: parsed,
+    hostname: host,
+    pinnedAddress,
     resolvedAddresses: addresses,
-    safeFetchInit: { redirect: "error" },
+    safeFetchInit: {
+      redirect: "error",
+      headers: {
+        Host: host,
+        "X-Pinned-Remote-Address": pinnedAddress,
+      },
+    },
   };
 }
