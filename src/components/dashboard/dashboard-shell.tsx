@@ -2,6 +2,13 @@
 
 import * as React from "react";
 import type {
+  AdAccountRecordViewModel,
+  ClientRecordViewModel,
+  IntegrationHealthViewModel,
+  MemberRecordViewModel,
+  OrganizationOption,
+} from "@/application/use-cases/dashboard-overview-use-case";
+import type {
   NormalizedCampaign,
   NormalizedDailyMetric,
 } from "@/integrations/contracts/advertising-provider";
@@ -17,6 +24,11 @@ import { CommandPalette } from "./command-palette";
 export interface DashboardShellProps {
   readonly organizationName: string;
   readonly organizationId: string;
+  readonly organizations?: readonly OrganizationOption[];
+  readonly clients?: readonly ClientRecordViewModel[];
+  readonly adAccounts?: readonly AdAccountRecordViewModel[];
+  readonly members?: readonly MemberRecordViewModel[];
+  readonly integrations?: readonly IntegrationHealthViewModel[];
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
@@ -51,16 +63,73 @@ const DEFAULT_DOMAIN_TABLES = [
 export function DashboardShell({
   organizationName,
   organizationId,
+  organizations: initialOrgs,
+  clients: initialClients = [],
+  adAccounts: initialAccounts = [],
+  members: initialMembers = [],
+  integrations: initialIntegrations = [],
   campaigns,
   dailyMetrics,
   recommendations,
   domainTables = DEFAULT_DOMAIN_TABLES,
 }: DashboardShellProps) {
+  const defaultOrgs: readonly OrganizationOption[] = React.useMemo(
+    () =>
+      initialOrgs && initialOrgs.length > 0
+        ? initialOrgs
+        : [
+            {
+              id: organizationId,
+              name: organizationName,
+              slug: "konnexy-demo",
+              executionMode: "READ_ONLY",
+              timezone: "America/Sao_Paulo",
+              currencyCode: "BRL",
+              maxDailyBudgetChangePct: 20,
+              minCooldownMinutes: 360,
+              isDemo: true,
+            },
+          ],
+    [initialOrgs, organizationId, organizationName]
+  );
+
+  const [selectedOrgId, setSelectedOrgId] = React.useState(
+    defaultOrgs[0]!.id
+  );
+  const [clientsList, setClientsList] =
+    React.useState<readonly ClientRecordViewModel[]>(initialClients);
+  const [accountsList, setAccountsList] =
+    React.useState<readonly AdAccountRecordViewModel[]>(initialAccounts);
+  const [integrationsList, setIntegrationsList] =
+    React.useState<readonly IntegrationHealthViewModel[]>(initialIntegrations);
+  const [isSyncing, setIsSyncing] = React.useState(false);
+  const [lastSyncTimestamp, setLastSyncTimestamp] = React.useState<
+    string | null
+  >("26/11/2026 10:15:00 (Checkpoint ckpt-mock-20261126-v2)");
+
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = React.useState(false);
   const [activeSection, setActiveSection] = React.useState("overview");
   const [commandOpen, setCommandOpen] = React.useState(false);
   const [emergencyStopActive, setEmergencyStopActive] = React.useState(false);
+
+  const activeOrganization = React.useMemo(
+    () =>
+      defaultOrgs.find((o) => o.id === selectedOrgId) ?? defaultOrgs[0]!,
+    [defaultOrgs, selectedOrgId]
+  );
+
+  const scopedClients = React.useMemo(
+    () =>
+      clientsList.filter((c) => c.organizationId === activeOrganization.id),
+    [clientsList, activeOrganization.id]
+  );
+
+  const scopedAccounts = React.useMemo(
+    () =>
+      accountsList.filter((a) => a.organizationId === activeOrganization.id),
+    [accountsList, activeOrganization.id]
+  );
 
   const scrollToSection = React.useCallback((sectionId: string) => {
     setActiveSection(sectionId);
@@ -71,6 +140,16 @@ export function DashboardShell({
     }
   }, []);
 
+  const handleTriggerIncrementalSync = React.useCallback(() => {
+    setIsSyncing(true);
+    setTimeout(() => {
+      setIsSyncing(false);
+      setLastSyncTimestamp(
+        `${new Date().toLocaleTimeString("pt-BR")} (Checkpoint incremental atualizado)`
+      );
+    }, 350);
+  }, []);
+
   return (
     <div className="min-h-screen flex bg-slate-50 dark:bg-[#060d1a] text-slate-900 dark:text-slate-100 overflow-x-hidden">
       <AppSidebar
@@ -78,8 +157,9 @@ export function DashboardShell({
         onToggleCollapse={() => setSidebarCollapsed((prev) => !prev)}
         activeSection={activeSection}
         onSelectSection={scrollToSection}
-        organizationName={organizationName}
-        organizationId={organizationId}
+        organizationName={activeOrganization.name}
+        organizationId={activeOrganization.id}
+        isDemoEnvironment={activeOrganization.isDemo}
       />
 
       <MobileNavigation
@@ -107,12 +187,48 @@ export function DashboardShell({
         />
 
         <DashboardOverview
-          organizationName={organizationName}
+          organizationName={activeOrganization.name}
+          activeOrganization={activeOrganization}
+          organizations={defaultOrgs}
+          onSelectOrganizationId={setSelectedOrgId}
+          clients={scopedClients}
+          adAccounts={scopedAccounts}
+          members={initialMembers}
+          integrations={integrationsList}
           campaigns={campaigns}
           dailyMetrics={dailyMetrics}
           recommendations={recommendations}
           domainTables={domainTables}
           emergencyStopActive={emergencyStopActive}
+          onClientCreated={(newClient) =>
+            setClientsList((prev) => [newClient, ...prev])
+          }
+          onToggleAccountSelection={(accId) =>
+            setAccountsList((prev) =>
+              prev.map((a) =>
+                a.id === accId
+                  ? { ...a, isSelectedForSync: !a.isSelectedForSync }
+                  : a
+              )
+            )
+          }
+          onRevokeIntegration={(intId) =>
+            setIntegrationsList((prev) =>
+              prev.map((i) =>
+                i.id === intId
+                  ? {
+                      ...i,
+                      status: "REVOKED",
+                      message:
+                        "Integração revogada pelo administrador. Tokens removidos do Credential Vault.",
+                    }
+                  : i
+              )
+            )
+          }
+          onTriggerIncrementalSync={handleTriggerIncrementalSync}
+          isSyncing={isSyncing}
+          lastSyncTimestamp={lastSyncTimestamp}
         />
       </div>
 

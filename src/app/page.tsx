@@ -8,6 +8,11 @@ export default async function HomePage() {
     <DashboardShell
       organizationName={vm.organizationName}
       organizationId={vm.organizationId}
+      organizations={vm.organizations}
+      clients={vm.clients}
+      adAccounts={vm.adAccounts}
+      members={vm.members}
+      integrations={vm.integrations}
       campaigns={vm.campaigns}
       dailyMetrics={vm.dailyMetrics}
       recommendations={vm.recommendations}

@@ -4,10 +4,21 @@ import * as React from "react";
 import {
   Activity,
   CheckCircle2,
+  Clock,
   DollarSign,
+  Filter,
+  MousePointerClick,
+  PlugZap,
   Target,
   TrendingUp,
 } from "lucide-react";
+import type {
+  AdAccountRecordViewModel,
+  ClientRecordViewModel,
+  IntegrationHealthViewModel,
+  MemberRecordViewModel,
+  OrganizationOption,
+} from "@/application/use-cases/dashboard-overview-use-case";
 import type {
   NormalizedCampaign,
   NormalizedDailyMetric,
@@ -29,14 +40,28 @@ import {
 import { PerformanceChart } from "./performance-chart";
 import { CampaignsTable } from "./campaigns-table";
 import { AIRecommendationsPanel } from "./ai-recommendations-panel";
+import { TenantManagementHub } from "./tenant-management-hub";
 
 export interface DashboardOverviewProps {
   readonly organizationName: string;
+  readonly activeOrganization: OrganizationOption;
+  readonly organizations: readonly OrganizationOption[];
+  readonly onSelectOrganizationId: (orgId: string) => void;
+  readonly clients: readonly ClientRecordViewModel[];
+  readonly adAccounts: readonly AdAccountRecordViewModel[];
+  readonly members: readonly MemberRecordViewModel[];
+  readonly integrations: readonly IntegrationHealthViewModel[];
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly recommendations: AIRecommendation[];
   readonly domainTables: readonly string[];
   readonly emergencyStopActive: boolean;
+  readonly onClientCreated: (newClient: ClientRecordViewModel) => void;
+  readonly onToggleAccountSelection: (accountId: string) => void;
+  readonly onRevokeIntegration: (integrationId: string) => void;
+  readonly onTriggerIncrementalSync: () => void;
+  readonly isSyncing: boolean;
+  readonly lastSyncTimestamp: string | null;
 }
 
 const MANDATORY_PIPELINE_STAGES = [
@@ -66,7 +91,7 @@ const SEVEN_ENGINES = [
   },
   {
     name: "Approval Engine",
-    detail: "Valida ApprovalRecord assinado, expiração e RBAC do aprovador",
+    detail: "Valida ApprovalRecord assinado com SHA-256 actionPayloadHash",
   },
   {
     name: "Simulation Engine",
@@ -82,35 +107,276 @@ const SEVEN_ENGINES = [
   },
 ];
 
+export type PeriodWindowDays = 3 | 7 | 14 | 30;
+
 export function DashboardOverview({
   organizationName,
+  activeOrganization,
+  organizations,
+  onSelectOrganizationId,
+  clients,
+  adAccounts,
+  members,
+  integrations,
   campaigns,
   dailyMetrics,
   recommendations,
   domainTables,
   emergencyStopActive,
+  onClientCreated,
+  onToggleAccountSelection,
+  onRevokeIntegration,
+  onTriggerIncrementalSync,
+  isSyncing,
+  lastSyncTimestamp,
 }: DashboardOverviewProps) {
-  const totalSpend7d = React.useMemo(
-    () => campaigns.reduce((acc, item) => acc + item.spend7dBrl, 0),
-    [campaigns]
-  );
-  const totalConversions7d = React.useMemo(
-    () => campaigns.reduce((acc, item) => acc + item.conversions7d, 0),
-    [campaigns]
-  );
-  const avgCpa7d =
-    totalConversions7d > 0 ? totalSpend7d / totalConversions7d : 0;
-  const weightedRoas =
-    totalSpend7d > 0
-      ? campaigns.reduce(
-          (acc, item) => acc + item.roas7d * item.spend7dBrl,
-          0
-        ) / totalSpend7d
-      : 0;
+  const [selectedClientId, setSelectedClientId] = React.useState<string>("ALL");
+  const [selectedAccountId, setSelectedAccountId] =
+    React.useState<string>("ALL");
+  const [periodWindowDays, setPeriodWindowDays] =
+    React.useState<PeriodWindowDays>(7);
+
+  // Filter accounts based on selected client
+  const availableAccounts = React.useMemo(() => {
+    if (selectedClientId === "ALL") return adAccounts;
+    return adAccounts.filter((a) => a.clientId === selectedClientId);
+  }, [adAccounts, selectedClientId]);
+
+  // Filter campaigns by active organization, client, and account selection
+  const scopedCampaigns = React.useMemo(() => {
+    if (!activeOrganization.isDemo) {
+      // Operational tenant without real Google Ads credentials has 0 synced campaigns (no fake data!)
+      return [];
+    }
+
+    return campaigns.filter((c) => {
+      if (selectedClientId !== "ALL" && c.clientId !== selectedClientId) {
+        return false;
+      }
+      if (selectedAccountId !== "ALL") {
+        const account = adAccounts.find((a) => a.id === selectedAccountId);
+        if (account && c.clientId !== account.clientId) {
+          return false;
+        }
+      }
+      return true;
+    });
+  }, [
+    activeOrganization.isDemo,
+    campaigns,
+    selectedClientId,
+    selectedAccountId,
+    adAccounts,
+  ]);
+
+  // Aggregate metrics for the selected time window (3d, 7d, 14d, 30d)
+  const aggregatedMetrics = React.useMemo(() => {
+    if (scopedCampaigns.length === 0) {
+      return {
+        hasData: false,
+        spendBrl: 0,
+        conversions: 0,
+        clicks: 0,
+        impressions: 0,
+        cpaBrl: null as number | null,
+        cpcBrl: null as number | null,
+        ctrPct: null as number | null,
+        roas: null as number | null,
+      };
+    }
+
+    const factor =
+      periodWindowDays === 3
+        ? 3 / 7
+        : periodWindowDays === 14
+          ? 2
+          : periodWindowDays === 30
+            ? 30 / 7
+            : 1;
+
+    let spendBrl = 0;
+    let conversions = 0;
+    let clicks = 0;
+    let impressions = 0;
+    let weightedRoasNumerator = 0;
+
+    for (const camp of scopedCampaigns) {
+      const win = camp.metricsByWindowDays?.[periodWindowDays];
+      const campSpend = win ? win.spendBrl : camp.spend7dBrl * factor;
+      const campConv = win
+        ? win.conversions
+        : Math.round(camp.conversions7d * factor);
+      const campClicks = win ? win.clicks : Math.round(camp.clicks7d * factor);
+      const campImpr = win
+        ? win.impressions
+        : Math.round(camp.impressions7d * factor);
+      const campRoas = win ? win.roas : camp.roas7d;
+
+      spendBrl += campSpend;
+      conversions += campConv;
+      clicks += campClicks;
+      impressions += campImpr;
+      weightedRoasNumerator += campRoas * campSpend;
+    }
+
+    // Phase 7 requirement: differentiate zero vs unavailable metric (N/D) when denominator is 0
+    const cpaBrl = conversions > 0 ? spendBrl / conversions : null;
+    const cpcBrl = clicks > 0 ? spendBrl / clicks : null;
+    const ctrPct = impressions > 0 ? (clicks / impressions) * 100 : null;
+    const roas = spendBrl > 0 ? weightedRoasNumerator / spendBrl : null;
+
+    return {
+      hasData: true,
+      spendBrl,
+      conversions,
+      clicks,
+      impressions,
+      cpaBrl,
+      cpcBrl,
+      ctrPct,
+      roas,
+    };
+  }, [scopedCampaigns, periodWindowDays]);
 
   return (
     <main className="flex-1 p-3 sm:p-4 lg:p-8 space-y-6 lg:space-y-8 max-w-[1600px] w-full mx-auto">
-      {/* Section 1: Overview & Analytical KPI Cards */}
+      {/* Operational Selectors Bar (Phase 7: Org, Client, AdAccount, Period, Last Sync & Health) */}
+      <section
+        aria-label="Filtros Operacionais Multi-Tenant"
+        className="rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0b1629]/95 p-4 space-y-3 shadow-sm"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-200 dark:border-slate-800">
+          <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-200">
+            <Filter className="h-4 w-4 text-cyan-500 dark:text-cyan-400" />
+            <span>
+              Escopo Operacional Multi-Tenant (Organização • Cliente • Conta •
+              Janela Temporal)
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex items-center gap-1.5 text-slate-500 dark:text-slate-400">
+              <Clock className="h-3.5 w-3.5 text-cyan-400" />
+              Última Sincronização:{" "}
+              <strong className="text-slate-800 dark:text-slate-200">
+                {activeOrganization.isDemo
+                  ? lastSyncTimestamp ?? "26/11/2026 10:15 (Sandbox Demo)"
+                  : "Sem sincronização (Credenciais Google Ads pendentes)"}
+              </strong>
+            </span>
+            <Badge
+              variant={activeOrganization.isDemo ? "demo" : "warning"}
+              data-testid="environment-scope-badge"
+            >
+              {activeOrganization.isDemo
+                ? "AMBIENTE DEMO SEPARADO"
+                : "AMBIENTE OPERACIONAL (SEM DADOS SIMULADOS)"}
+            </Badge>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+          <div>
+            <label
+              htmlFor="org-selector"
+              className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+            >
+              1. Organização (Tenant)
+            </label>
+            <select
+              id="org-selector"
+              data-testid="org-selector"
+              value={activeOrganization.id}
+              onChange={(e) => {
+                onSelectOrganizationId(e.target.value);
+                setSelectedClientId("ALL");
+                setSelectedAccountId("ALL");
+              }}
+              className="w-full h-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 text-xs"
+            >
+              {organizations.map((org) => (
+                <option key={org.id} value={org.id}>
+                  {org.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="client-selector"
+              className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+            >
+              2. Cliente
+            </label>
+            <select
+              id="client-selector"
+              data-testid="client-selector"
+              value={selectedClientId}
+              onChange={(e) => {
+                setSelectedClientId(e.target.value);
+                setSelectedAccountId("ALL");
+              }}
+              className="w-full h-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 text-xs"
+            >
+              <option value="ALL">Todos os Clientes Autorizados</option>
+              {clients.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="account-selector"
+              className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+            >
+              3. Conta de Anúncios / Subconta MCC
+            </label>
+            <select
+              id="account-selector"
+              data-testid="account-selector"
+              value={selectedAccountId}
+              onChange={(e) => setSelectedAccountId(e.target.value)}
+              className="w-full h-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 text-xs"
+            >
+              <option value="ALL">Todas as Contas Selecionadas</option>
+              {availableAccounts.map((acc) => (
+                <option key={acc.id} value={acc.id}>
+                  {acc.name} ({acc.externalAccountId})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <label
+              htmlFor="period-selector"
+              className="block text-[11px] font-medium text-slate-500 dark:text-slate-400 mb-1"
+            >
+              4. Janela Temporal Analítica
+            </label>
+            <select
+              id="period-selector"
+              data-testid="period-selector"
+              value={periodWindowDays}
+              onChange={(e) =>
+                setPeriodWindowDays(Number(e.target.value) as PeriodWindowDays)
+              }
+              className="w-full h-9 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 px-2.5 text-xs"
+            >
+              <option value={3}>Últimos 3 dias</option>
+              <option value={7}>Últimos 7 dias (Padrão)</option>
+              <option value={14}>Últimos 14 dias</option>
+              <option value={30}>Últimos 30 dias</option>
+            </select>
+          </div>
+        </div>
+      </section>
+
+      {/* Section 1: Overview & Analytical KPI Cards (Differentiating Zero, No Data, and N/D) */}
       <section id="overview" className="space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <div>
@@ -119,89 +385,176 @@ export function DashboardOverview({
             </h1>
             <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
               Organização: <strong>{organizationName}</strong> • Janela
-              Analítica: Últimos 7 dias (Dados Demonstrativos)
+              Analítica: Últimos {periodWindowDays} dias
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            <Badge variant="demo">MODO DEMONSTRAÇÃO • SOMENTE LEITURA</Badge>
+          <div className="flex flex-wrap items-center gap-2">
+            {integrations.map((intg) => (
+              <Badge
+                key={intg.id}
+                variant={
+                  intg.status === "CONNECTED"
+                    ? "success"
+                    : intg.status === "SANDBOX_DEMO"
+                      ? "demo"
+                      : "warning"
+                }
+              >
+                <PlugZap className="h-3 w-3" aria-hidden="true" />
+                {intg.provider}: {intg.status}
+              </Badge>
+            ))}
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-3 sm:gap-4">
+          {/* KPI 1: Spend */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
-              <CardDescription>Investimento Consolidado (7d)</CardDescription>
+              <CardDescription>
+                Investimento ({periodWindowDays}d)
+              </CardDescription>
               <DollarSign
                 className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
                 aria-hidden="true"
               />
             </CardHeader>
             <CardContent>
-              <div className="text-xl sm:text-2xl font-bold">
-                {formatCurrencyBrl(totalSpend7d)}
+              <div className="text-lg sm:text-xl font-bold">
+                {aggregatedMetrics.hasData
+                  ? formatCurrencyBrl(aggregatedMetrics.spendBrl)
+                  : "Sem dados"}
               </div>
-              <div className="flex items-center justify-between mt-2 text-xs text-slate-500 dark:text-slate-400">
-                <span>{campaigns.length} campanhas monitoradas</span>
-                <Badge variant="demo">DEMO</Badge>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                <span>{scopedCampaigns.length} campanhas</span>
+                <Badge variant={activeOrganization.isDemo ? "demo" : "secondary"}>
+                  {activeOrganization.isDemo ? "DEMO" : "REAL"}
+                </Badge>
               </div>
             </CardContent>
           </Card>
 
+          {/* KPI 2: Conversions */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
-              <CardDescription>Conversões Rastreadas (7d)</CardDescription>
+              <CardDescription>
+                Conversões ({periodWindowDays}d)
+              </CardDescription>
               <Target
                 className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
                 aria-hidden="true"
               />
             </CardHeader>
             <CardContent>
-              <div className="text-xl sm:text-2xl font-bold">
-                {formatNumberPtBr(totalConversions7d)}
+              <div className="text-lg sm:text-xl font-bold">
+                {aggregatedMetrics.hasData
+                  ? formatNumberPtBr(aggregatedMetrics.conversions)
+                  : "Sem dados"}
               </div>
-              <div className="flex items-center justify-between mt-2 text-xs text-emerald-600 dark:text-emerald-400">
-                <span>+14,2% vs. semana anterior</span>
-                <Badge variant="demo">DEMO</Badge>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-emerald-600 dark:text-emerald-400">
+                <span>
+                  {aggregatedMetrics.hasData
+                    ? `${formatNumberPtBr(aggregatedMetrics.clicks)} cliques`
+                    : "Aguardando sync"}
+                </span>
               </div>
             </CardContent>
           </Card>
 
+          {/* KPI 3: CPA */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
-              <CardDescription>
-                Custo por Aquisição Médio (CPA)
-              </CardDescription>
+              <CardDescription>CPA Médio ({periodWindowDays}d)</CardDescription>
               <Activity
                 className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
                 aria-hidden="true"
               />
             </CardHeader>
             <CardContent>
-              <div className="text-xl sm:text-2xl font-bold">
-                {formatCurrencyBrl(avgCpa7d)}
+              <div className="text-lg sm:text-xl font-bold">
+                {!aggregatedMetrics.hasData
+                  ? "Sem dados"
+                  : aggregatedMetrics.cpaBrl !== null
+                    ? formatCurrencyBrl(aggregatedMetrics.cpaBrl)
+                    : "N/D (0 conv.)"}
               </div>
-              <div className="flex items-center justify-between mt-2 text-xs text-slate-500 dark:text-slate-400">
-                <span>Meta ponderada: R$ 42,00</span>
-                <Badge variant="success">Dentro da Meta</Badge>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                <span>Meta: R$ 42,00</span>
               </div>
             </CardContent>
           </Card>
 
+          {/* KPI 4: CPC */}
           <Card>
             <CardHeader className="pb-2 flex flex-row items-center justify-between">
-              <CardDescription>ROAS Médio Ponderado (7d)</CardDescription>
+              <CardDescription>CPC Médio ({periodWindowDays}d)</CardDescription>
+              <MousePointerClick
+                className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
+                aria-hidden="true"
+              />
+            </CardHeader>
+            <CardContent>
+              <div className="text-lg sm:text-xl font-bold">
+                {!aggregatedMetrics.hasData
+                  ? "Sem dados"
+                  : aggregatedMetrics.cpcBrl !== null
+                    ? formatCurrencyBrl(aggregatedMetrics.cpcBrl)
+                    : "N/D (0 cliques)"}
+              </div>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                <span>Leilão Normalizado</span>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* KPI 5: CTR */}
+          <Card>
+            <CardHeader className="pb-2 flex flex-row items-center justify-between">
+              <CardDescription>CTR Médio ({periodWindowDays}d)</CardDescription>
+              <Activity
+                className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
+                aria-hidden="true"
+              />
+            </CardHeader>
+            <CardContent>
+              <div className="text-lg sm:text-xl font-bold">
+                {!aggregatedMetrics.hasData
+                  ? "Sem dados"
+                  : aggregatedMetrics.ctrPct !== null
+                    ? formatPercentPtBr(aggregatedMetrics.ctrPct)
+                    : "N/D (0 impr.)"}
+              </div>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                <span>
+                  {aggregatedMetrics.hasData
+                    ? `${formatNumberPtBr(aggregatedMetrics.impressions)} impr.`
+                    : "0 impr."}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* KPI 6: ROAS */}
+          <Card>
+            <CardHeader className="pb-2 flex flex-row items-center justify-between">
+              <CardDescription>
+                ROAS Ponderado ({periodWindowDays}d)
+              </CardDescription>
               <TrendingUp
                 className="h-4 w-4 text-cyan-600 dark:text-cyan-400"
                 aria-hidden="true"
               />
             </CardHeader>
             <CardContent>
-              <div className="text-xl sm:text-2xl font-bold">
-                {weightedRoas.toFixed(2).replace(".", ",")}x
+              <div className="text-lg sm:text-xl font-bold">
+                {!aggregatedMetrics.hasData
+                  ? "Sem dados"
+                  : aggregatedMetrics.roas !== null
+                    ? `${aggregatedMetrics.roas.toFixed(2).replace(".", ",")}x`
+                    : "N/D"}
               </div>
-              <div className="flex items-center justify-between mt-2 text-xs text-slate-500 dark:text-slate-400">
-                <span>CTR Médio: {formatPercentPtBr(4.78)}</span>
-                <Badge variant="demo">DEMO</Badge>
+              <div className="flex items-center justify-between mt-2 text-[11px] text-slate-500 dark:text-slate-400">
+                <span>Retorno Bruto</span>
               </div>
             </CardContent>
           </Card>
@@ -210,7 +563,9 @@ export function DashboardOverview({
 
       {/* Section 2: Interactive Chart + Automation Governance Summary */}
       <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-6">
-        <PerformanceChart metrics={dailyMetrics} />
+        <PerformanceChart
+          metrics={activeOrganization.isDemo ? dailyMetrics : []}
+        />
 
         <Card id="automation-engine">
           <CardHeader>
@@ -225,7 +580,8 @@ export function DashboardOverview({
               </Badge>
             </div>
             <CardDescription>
-              Pipeline de 9 etapas com Máquina de Estados, Cooldown e Idempotência
+              Pipeline de 9 etapas com Máquina de Estados, Cooldown e
+              Idempotência
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -267,20 +623,36 @@ export function DashboardOverview({
         </Card>
       </section>
 
-      {/* Section 3: TanStack Table of Campaigns */}
-      <section id="campaigns">
-        <CampaignsTable campaigns={campaigns} />
+      {/* Section 3: Phase 4 Tenant Management Hub (Orgs, Members, Clients, Accounts, Integrations, Settings) */}
+      <section>
+        <TenantManagementHub
+          activeOrganization={activeOrganization}
+          clients={clients}
+          adAccounts={adAccounts}
+          members={members}
+          integrations={integrations}
+          onClientCreated={onClientCreated}
+          onToggleAccountSelection={onToggleAccountSelection}
+          onRevokeIntegration={onRevokeIntegration}
+          onTriggerIncrementalSync={onTriggerIncrementalSync}
+          isSyncing={isSyncing}
+        />
       </section>
 
-      {/* Section 4: AI Supervised Recommendations */}
+      {/* Section 4: TanStack Table of Campaigns */}
+      <section id="campaigns">
+        <CampaignsTable campaigns={scopedCampaigns} />
+      </section>
+
+      {/* Section 5: AI Supervised Recommendations */}
       <section id="ai-recommendations">
         <AIRecommendationsPanel
-          recommendations={recommendations}
+          recommendations={activeOrganization.isDemo ? recommendations : []}
           emergencyStopActive={emergencyStopActive}
         />
       </section>
 
-      {/* Section 5: Drizzle 22 Domains & Provider Readiness Status */}
+      {/* Section 6: Drizzle Domains & Provider Readiness Status */}
       <section id="architecture-docs">
         <Card>
           <CardHeader>
@@ -292,7 +664,7 @@ export function DashboardOverview({
                 </CardTitle>
                 <CardDescription className="mt-1">
                   Schemas com FKs compostas (organization_id, id), políticas RLS
-                  com USING/WITH CHECK e migrations versionadas
+                  com USING/WITH CHECK e privilégios por tabela
                 </CardDescription>
               </div>
               <Badge variant="default">
