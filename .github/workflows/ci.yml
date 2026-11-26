@@ -1,0 +1,82 @@
+name: Konnexy Ads CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "fix/**"
+      - "foundation/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-security-and-e2e:
+    name: Audit, Secret Scan, Lint, Typecheck, Unit, PostgreSQL RLS, Build & Playwright
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      NODE_ENV: test
+      NEXT_PUBLIC_APP_NAME: "Konnexy Ads"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+      NEXT_PUBLIC_DEFAULT_EXECUTION_MODE: "READ_ONLY"
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/konnexy_ads_test"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify no accidental secret files or leaked live keys
+        run: |
+          if git ls-files | grep -E '(^\.env$|\.env\.local$|\.env\.production$|\.pem$|\.key$)'; then
+            echo "ERROR: Secret or private environment file is tracked in git!"
+            exit 1
+          fi
+          if git grep -E '(sk-proj-[A-Za-z0-9]{20,}|ya29\.[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{35})' -- ':!src/tests/*' ':!*.md'; then
+            echo "ERROR: Potential live API key detected in source code!"
+            exit 1
+          fi
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: 1. Install dependencies (frozen lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: 2. Security Audit (Block on High or Critical vulnerabilities)
+        run: pnpm audit --audit-level=high
+
+      - name: 3. Run ESLint
+        run: pnpm lint
+
+      - name: 4. Run TypeScript Strict Typecheck
+        run: pnpm typecheck
+
+      - name: 5. Run Unit & Disposable PostgreSQL RLS Integration Tests
+        run: pnpm test
+
+      - name: 6. Build Next.js Production Application
+        run: pnpm build
+
+      - name: 7. Install Playwright Chromium Browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: 8. Run Playwright E2E & Multi-Viewport Accessibility Tests
+        run: pnpm test:e2e
