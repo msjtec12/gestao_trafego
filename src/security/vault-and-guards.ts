@@ -1,52 +1,41 @@
-import crypto from "crypto";
+﻿import crypto from "crypto";
 import dns from "dns/promises";
 import net from "net";
 
-const SENSITIVE_KEYS_REGEX =
-  /^(password|secret|token|access_?token|refresh_?token|client_?secret|api_?key|authorization|developer_?token|encrypted_?.*|cookie|session_?token|private_?key|webhook_?secret)$/i;
+export { redactSensitiveData, toPublicSafeErrorMessage } from "./public-errors";
 
-const INLINE_BEARER_OR_KEY_REGEX =
-  /(Bearer\s+[A-Za-z0-9\-._~+/]+=*|sk-[A-Za-z0-9]{16,}|ya29\.[A-Za-z0-9\-_]+)/gi;
-
-export function redactSensitiveData<T>(
-  payload: T,
-  seen: WeakSet<object> = new WeakSet()
-): T {
-  if (payload === null || payload === undefined) {
-    return payload;
+/**
+ * Canonical JSON serialization and SHA-256 hashing to bind an ApprovalRecord
+ * to the immutable action content (organizationId + campaignId + actionType + payload).
+ */
+export function canonicalizeJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
   }
-
-  if (typeof payload === "string") {
-    return payload.replace(
-      INLINE_BEARER_OR_KEY_REGEX,
-      "[REDACTED_TOKEN]"
-    ) as unknown as T;
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalizeJson(v)).join(",")}]`;
   }
+  const record = value as Record<string, unknown>;
+  const sortedKeys = Object.keys(record).sort();
+  const entries = sortedKeys.map(
+    (k) => `${JSON.stringify(k)}:${canonicalizeJson(record[k])}`
+  );
+  return `{${entries.join(",")}}`;
+}
 
-  if (Array.isArray(payload)) {
-    return payload.map((item) => redactSensitiveData(item, seen)) as unknown as T;
-  }
-
-  if (typeof payload === "object") {
-    if (seen.has(payload as object)) {
-      return "[CIRCULAR_REF]" as unknown as T;
-    }
-    seen.add(payload as object);
-
-    const clean: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(
-      payload as Record<string, unknown>
-    )) {
-      if (SENSITIVE_KEYS_REGEX.test(key)) {
-        clean[key] = "[REDACTED]";
-      } else {
-        clean[key] = redactSensitiveData(value, seen);
-      }
-    }
-    return clean as T;
-  }
-
-  return payload;
+export function computeActionPayloadHash(params: {
+  readonly organizationId: string;
+  readonly campaignId: string;
+  readonly actionType: string;
+  readonly payload: Record<string, unknown>;
+}): string {
+  const canonical = canonicalizeJson({
+    organizationId: params.organizationId.trim(),
+    campaignId: params.campaignId.trim(),
+    actionType: params.actionType.trim(),
+    payload: params.payload,
+  });
+  return crypto.createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
 export interface CredentialAadContext {
@@ -84,10 +73,6 @@ function buildAadBuffer(aad?: CredentialAadContext): Buffer | null {
   );
 }
 
-/**
- * Encrypts OAuth credentials with AES-256-GCM, key versioning (v1:iv:tag:cipher),
- * high-entropy key validation, and optional tenant+integration AAD binding.
- */
 export function encryptCredential(
   plainText: string,
   hexKey64OrKeyRing: string | KeyRing,
@@ -126,6 +111,70 @@ export function encryptCredential(
   const authTag = cipher.getAuthTag();
 
   return `${version}:${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted.toString("hex")}`;
+}
+
+/**
+ * Mandatory AAD wrapper for Stage 2 OAuth Credential Vault.
+ */
+export function encryptVaultCredentialWithMandatoryAad(params: {
+  readonly plainText: string;
+  readonly keyRing: string | KeyRing;
+  readonly keyVersion?: string;
+  readonly aad: CredentialAadContext;
+}): string {
+  if (!params.aad?.organizationId?.trim() || !params.aad?.integrationId?.trim()) {
+    throw new Error(
+      "Vault AAD (organizationId and integrationId) is mandatory for OAuth token encryption."
+    );
+  }
+  return encryptCredential(params.plainText, params.keyRing, {
+    keyVersion: params.keyVersion ?? "v1",
+    aad: params.aad,
+  });
+}
+
+export function decryptVaultCredentialWithMandatoryAad(params: {
+  readonly cipherPayload: string;
+  readonly keyRing: string | KeyRing;
+  readonly aad: CredentialAadContext;
+}): string {
+  if (!params.aad?.organizationId?.trim() || !params.aad?.integrationId?.trim()) {
+    throw new Error(
+      "Vault AAD (organizationId and integrationId) is mandatory for OAuth token decryption."
+    );
+  }
+  return decryptCredential(params.cipherPayload, params.keyRing, {
+    aad: params.aad,
+  });
+}
+
+/**
+ * Planned key rotation helper: decrypts an existing credential using its embedded
+ * key version in `keyRing` (verifying AAD integrity) and re-encrypts it under `targetKeyVersion`.
+ */
+export function rotateVaultCredentialKeyVersion(params: {
+  readonly cipherPayload: string;
+  readonly keyRing: KeyRing;
+  readonly targetKeyVersion: string;
+  readonly aad: CredentialAadContext;
+}): { readonly rotatedCipherPayload: string; readonly keyVersion: string } {
+  const plainText = decryptVaultCredentialWithMandatoryAad({
+    cipherPayload: params.cipherPayload,
+    keyRing: params.keyRing,
+    aad: params.aad,
+  });
+
+  const rotatedCipherPayload = encryptVaultCredentialWithMandatoryAad({
+    plainText,
+    keyRing: params.keyRing,
+    keyVersion: params.targetKeyVersion,
+    aad: params.aad,
+  });
+
+  return {
+    rotatedCipherPayload,
+    keyVersion: params.targetKeyVersion,
+  };
 }
 
 export function decryptCredential(
@@ -246,6 +295,12 @@ export function validateSafeExternalUrl(rawUrl: string): URL {
     throw new Error("SSRF Guard: Embedded URL credentials are not permitted.");
   }
 
+  if (parsed.port && parsed.port !== "443") {
+    throw new Error(
+      `SSRF Guard: Non-standard HTTPS port '${parsed.port}' is blocked.`
+    );
+  }
+
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   const forbiddenHostPatterns = [
     /^localhost$/,
@@ -278,8 +333,18 @@ const defaultDnsResolver: DnsResolverFn = async (hostname: string) => {
   return await dns.lookup(hostname, { all: true, verbatim: true });
 };
 
+export interface SafePinnedHttpTransportContext {
+  readonly url: URL;
+  readonly hostname: string;
+  readonly pinnedAddress: string;
+  readonly resolvedAddresses: readonly string[];
+  readonly safeFetchInit: RequestInit;
+}
+
 /**
- * Full async SSRF guard with DNS resolution validation and safe redirect inspection.
+ * Full async SSRF guard with DNS resolution validation, pinned IP transport context
+ * (preventing DNS rebinding TOCTOU between lookup and HTTP socket connect), and
+ * safe redirect inspection.
  */
 export async function resolveAndValidateSafeExternalUrl(
   rawUrl: string,
@@ -287,12 +352,9 @@ export async function resolveAndValidateSafeExternalUrl(
     readonly dnsResolver?: DnsResolverFn;
     readonly redirectChainUrls?: readonly string[];
     readonly maxRedirects?: number;
+    readonly timeoutMs?: number;
   }
-): Promise<{
-  readonly url: URL;
-  readonly resolvedAddresses: readonly string[];
-  readonly safeFetchInit: RequestInit;
-}> {
+): Promise<SafePinnedHttpTransportContext> {
   const maxRedirects = options?.maxRedirects ?? 3;
   const redirectChain = options?.redirectChainUrls ?? [];
 
@@ -312,8 +374,16 @@ export async function resolveAndValidateSafeExternalUrl(
   if (net.isIP(host) !== 0) {
     return {
       url: parsed,
+      hostname: host,
+      pinnedAddress: host,
       resolvedAddresses: [host],
-      safeFetchInit: { redirect: "error" },
+      safeFetchInit: {
+        redirect: "error",
+        headers: {
+          Host: host,
+          "X-Pinned-Remote-Address": host,
+        },
+      },
     };
   }
 
@@ -321,7 +391,9 @@ export async function resolveAndValidateSafeExternalUrl(
   const records = await resolver(host);
 
   if (!records || records.length === 0) {
-    throw new Error(`SSRF Guard: DNS resolution returned no records for '${host}'.`);
+    throw new Error(
+      `SSRF Guard: DNS resolution returned no records for '${host}'.`
+    );
   }
 
   const addresses: string[] = [];
@@ -334,9 +406,19 @@ export async function resolveAndValidateSafeExternalUrl(
     addresses.push(rec.address);
   }
 
+  const pinnedAddress = addresses[0]!;
+
   return {
     url: parsed,
+    hostname: host,
+    pinnedAddress,
     resolvedAddresses: addresses,
-    safeFetchInit: { redirect: "error" },
+    safeFetchInit: {
+      redirect: "error",
+      headers: {
+        Host: host,
+        "X-Pinned-Remote-Address": pinnedAddress,
+      },
+    },
   };
 }

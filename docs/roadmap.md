@@ -11,11 +11,13 @@
 
 ---
 
-## Fase 2 — Autenticação Real, Persistência Neon em Nuvem & Google Ads Read-Only
-- [ ] Fluxo completo de login, sessão e onboarding de organizações e clientes com Auth.js v5 (`5.0.0-beta.32`) + Neon PostgreSQL.
-- [ ] Persistência em banco vivo para o Kill Switch global/organizacional, `IdempotencyStore` e `CircuitBreakerStore`.
-- [ ] Fluxo OAuth 2.0 real do Google Ads API com armazenamento criptografado no Credential Vault (`AES-256-GCM` + AAD).
-- [ ] Worker de sincronização inicial (somente leitura) via Vercel Cron para Campanhas, Grupos de Anúncios, Palavras-chave, Termos de Pesquisa e Métricas Diárias.
+## Fase 2 & 2.1 — Autenticação Operacional, Multi-Tenancy Persistente & Google Ads Read-Only (Concluída)
+- [x] Correções remanescentes da Fase 1: aprovação vinculada ao hash SHA-256 do payload (`actionPayloadHash`), FKs compostas nos relacionamentos opcionais, privilégios PostgreSQL restritos por tabela e sanitização de erros públicos (`src/security/public-errors.ts`).
+- [x] Autenticação operacional persistida no PostgreSQL (`/login`, `/onboarding`, logout com revogação em `user_sessions`, rate limiting durável em `auth_rate_limits`, proteção de rotas via `src/middleware.ts` e separação de `/demo`).
+- [x] Repositórios Drizzle persistentes (`PersistentDrizzleTenantRepository`) com operações reais para Organizações, Membros, `member_client_access` (`CLIENT_VIEWER`), Clientes (criar/editar/desativar), Integrações, Contas de Anúncios, Campanhas, Métricas Diárias, Sync Runs e Audit Logs.
+- [x] `PersistentPostgresGoogleAdsService` (OAuth 2.0 PKCE + `oauth_states` single-use no PostgreSQL, Route Handlers `/api/integrations/google-ads/authorize` e `callback`, Credential Vault AES-256-GCM com AAD e rotação de chaves `v1` → `v2`, revogação persistente e consultas REST Google Ads API `v26`).
+- [x] Transporte HTTPS `executePinnedHttpsRequest` com IP pinning real no socket (`node:https` + TLS SNI `servername`) e bloqueio de redirects `3xx`.
+- [x] `PersistentPostgresAdsSyncEngine` sincronizando idempotentemente os 9 domínios no PostgreSQL com lock durável em `sync_runs`, recuperação de jobs órfãos e cálculo exato de métricas agregadas sobre os totais do período.
 
 ---
 

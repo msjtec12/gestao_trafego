@@ -93,6 +93,13 @@ export const notificationSeverityEnum = pgEnum("notification_severity", [
   "CRITICAL",
 ]);
 
+export const syncRunStatusEnum = pgEnum("sync_run_status", [
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "SKIPPED_CONCURRENT_LOCK",
+]);
+
 // ============================================================================
 // 1. ORGANIZATIONS (Multi-Tenant Root)
 // ============================================================================
@@ -140,6 +147,7 @@ export const users = pgTable(
     id: uuid("id").defaultRandom().primaryKey(),
     email: varchar("email", { length: 255 }).notNull(),
     fullName: varchar("full_name", { length: 160 }).notNull(),
+    passwordHash: text("password_hash"),
     avatarUrl: text("avatar_url"),
     emailVerifiedAt: timestamp("email_verified_at", { withTimezone: true }),
     isActive: boolean("is_active").default(true).notNull(),
@@ -153,6 +161,42 @@ export const users = pgTable(
   },
   (table) => [uniqueIndex("users_email_idx").on(table.email)]
 );
+
+// ============================================================================
+// 2B. USER SESSIONS (Persistent Server-Side Sessions)
+// ============================================================================
+
+export const userSessions = pgTable(
+  "user_sessions",
+  {
+    sessionToken: varchar("session_token", { length: 128 }).primaryKey(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    activeOrganizationId: uuid("active_organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [index("user_sessions_user_idx").on(table.userId)]
+);
+
+// ============================================================================
+// 2C. AUTH RATE LIMITS (Durable Brute-Force Protection in PostgreSQL)
+// ============================================================================
+
+export const authRateLimits = pgTable("auth_rate_limits", {
+  identifier: varchar("identifier", { length: 255 }).primaryKey(),
+  attempts: integer("attempts").default(0).notNull(),
+  firstAttemptAt: timestamp("first_attempt_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+  lockedUntil: timestamp("locked_until", { withTimezone: true }),
+});
 
 // ============================================================================
 // 3. MEMBERSHIPS (RBAC Multi-Tenant)
@@ -222,7 +266,47 @@ export const clients = pgTable(
 );
 
 // ============================================================================
-// 5. INTEGRATIONS (Encrypted OAuth Credentials)
+// 4B. MEMBER CLIENT ACCESS (CLIENT_VIEWER Granular Authorization)
+// ============================================================================
+
+export const memberClientAccess = pgTable(
+  "member_client_access",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    membershipId: uuid("membership_id").notNull(),
+    clientId: uuid("client_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    uniqueIndex("member_client_access_org_id_unique").on(
+      table.organizationId,
+      table.id
+    ),
+    uniqueIndex("member_client_access_org_member_client_idx").on(
+      table.organizationId,
+      table.membershipId,
+      table.clientId
+    ),
+    foreignKey({
+      name: "member_client_access_org_membership_fk",
+      columns: [table.organizationId, table.membershipId],
+      foreignColumns: [memberships.organizationId, memberships.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "member_client_access_org_client_fk",
+      columns: [table.organizationId, table.clientId],
+      foreignColumns: [clients.organizationId, clients.id],
+    }).onDelete("cascade"),
+  ]
+);
+
+// ============================================================================
+// 5. INTEGRATIONS (Encrypted OAuth Credentials with Key Version & AAD)
 // ============================================================================
 
 export const integrations = pgTable(
@@ -236,12 +320,18 @@ export const integrations = pgTable(
     externalAccountLabel: varchar("external_account_label", {
       length: 160,
     }).notNull(),
+    managerCustomerId: varchar("manager_customer_id", { length: 64 }),
     status: integrationStatusEnum("status").default("SANDBOX_DEMO").notNull(),
     encryptedAccessToken: text("encrypted_access_token"),
     encryptedRefreshToken: text("encrypted_refresh_token"),
+    encryptionKeyVersion: varchar("encryption_key_version", { length: 16 })
+      .default("v1")
+      .notNull(),
     scopes: jsonb("scopes").$type<string[]>().default([]).notNull(),
     tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
     lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
+    lastCheckpointToken: varchar("last_checkpoint_token", { length: 255 }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
     isDemoIntegration: boolean("is_demo_integration").default(true).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
@@ -260,7 +350,35 @@ export const integrations = pgTable(
 );
 
 // ============================================================================
-// 6. AD ACCOUNTS
+// 5B. OAUTH STATES (Single-Use Persistent CSRF & PKCE State Store)
+// ============================================================================
+
+export const oauthStates = pgTable(
+  "oauth_states",
+  {
+    nonce: varchar("nonce", { length: 128 }).primaryKey(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    provider: adProviderEnum("provider").notNull(),
+    codeVerifier: varchar("code_verifier", { length: 255 }).notNull(),
+    redirectUri: text("redirect_uri").notNull(),
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => [
+    index("oauth_states_org_user_idx").on(table.organizationId, table.userId),
+  ]
+);
+
+// ============================================================================
+// 6. AD ACCOUNTS (Supports Individual & MCC Sub-Accounts)
 // ============================================================================
 
 export const adAccounts = pgTable(
@@ -276,6 +394,9 @@ export const adAccounts = pgTable(
     externalAccountId: varchar("external_account_id", {
       length: 100,
     }).notNull(),
+    managerCustomerId: varchar("manager_customer_id", { length: 64 }),
+    isMccAccount: boolean("is_mcc_account").default(false).notNull(),
+    isSelectedForSync: boolean("is_selected_for_sync").default(true).notNull(),
     name: varchar("name", { length: 160 }).notNull(),
     currencyCode: varchar("currency_code", { length: 3 })
       .default("BRL")
@@ -389,6 +510,11 @@ export const adGroups = pgTable(
   },
   (table) => [
     uniqueIndex("ad_groups_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("ad_groups_org_camp_ext_idx").on(
+      table.organizationId,
+      table.campaignId,
+      table.externalAdGroupId
+    ),
     index("ad_groups_org_campaign_idx").on(
       table.organizationId,
       table.campaignId
@@ -431,6 +557,11 @@ export const ads = pgTable(
   },
   (table) => [
     uniqueIndex("ads_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("ads_org_adgroup_ext_idx").on(
+      table.organizationId,
+      table.adGroupId,
+      table.externalAdId
+    ),
     index("ads_org_adgroup_idx").on(table.organizationId, table.adGroupId),
     foreignKey({
       name: "ads_org_ad_group_fk",
@@ -470,6 +601,11 @@ export const keywords = pgTable(
   },
   (table) => [
     uniqueIndex("keywords_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("keywords_org_adgroup_ext_idx").on(
+      table.organizationId,
+      table.adGroupId,
+      table.externalKeywordId
+    ),
     index("keywords_org_adgroup_idx").on(table.organizationId, table.adGroupId),
     foreignKey({
       name: "keywords_org_ad_group_fk",
@@ -480,7 +616,7 @@ export const keywords = pgTable(
 );
 
 // ============================================================================
-// 11. SEARCH TERMS
+// 11. SEARCH TERMS (Composite FK on optional ad_group_id)
 // ============================================================================
 
 export const searchTerms = pgTable(
@@ -509,6 +645,12 @@ export const searchTerms = pgTable(
       table.organizationId,
       table.id
     ),
+    uniqueIndex("search_terms_org_camp_term_date_idx").on(
+      table.organizationId,
+      table.campaignId,
+      table.searchTerm,
+      table.observedDate
+    ),
     index("search_terms_org_campaign_idx").on(
       table.organizationId,
       table.campaignId
@@ -517,6 +659,11 @@ export const searchTerms = pgTable(
       name: "search_terms_org_campaign_fk",
       columns: [table.organizationId, table.campaignId],
       foreignColumns: [campaigns.organizationId, campaigns.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "search_terms_org_ad_group_fk",
+      columns: [table.organizationId, table.adGroupId],
+      foreignColumns: [adGroups.organizationId, adGroups.id],
     }).onDelete("cascade"),
   ]
 );
@@ -602,6 +749,11 @@ export const conversions = pgTable(
   },
   (table) => [
     uniqueIndex("conversions_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("conversions_org_acc_ext_idx").on(
+      table.organizationId,
+      table.adAccountId,
+      table.externalConversionId
+    ),
     index("conversions_org_account_idx").on(
       table.organizationId,
       table.adAccountId
@@ -615,7 +767,7 @@ export const conversions = pgTable(
 );
 
 // ============================================================================
-// 14. BUDGETS
+// 14. BUDGETS (Composite FK on optional campaign_id)
 // ============================================================================
 
 export const budgets = pgTable(
@@ -627,7 +779,7 @@ export const budgets = pgTable(
       .references(() => organizations.id, { onDelete: "cascade" }),
     clientId: uuid("client_id").notNull(),
     campaignId: uuid("campaign_id"),
-    periodMonth: varchar("period_month", { length: 7 }).notNull(), // YYYY-MM
+    periodMonth: varchar("period_month", { length: 7 }).notNull(),
     allocatedCents: bigint("allocated_cents", { mode: "number" }).notNull(),
     spentCents: bigint("spent_cents", { mode: "number" }).default(0).notNull(),
     maxDailyHardLimitCents: bigint("max_daily_hard_limit_cents", {
@@ -643,6 +795,11 @@ export const budgets = pgTable(
   },
   (table) => [
     uniqueIndex("budgets_org_id_unique").on(table.organizationId, table.id),
+    uniqueIndex("budgets_org_client_period_unique_idx").on(
+      table.organizationId,
+      table.clientId,
+      table.periodMonth
+    ),
     index("budgets_org_client_period_idx").on(
       table.organizationId,
       table.clientId,
@@ -652,6 +809,11 @@ export const budgets = pgTable(
       name: "budgets_org_client_fk",
       columns: [table.organizationId, table.clientId],
       foreignColumns: [clients.organizationId, clients.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "budgets_org_campaign_fk",
+      columns: [table.organizationId, table.campaignId],
+      foreignColumns: [campaigns.organizationId, campaigns.id],
     }).onDelete("cascade"),
   ]
 );
@@ -758,7 +920,7 @@ export const automationRules = pgTable(
 );
 
 // ============================================================================
-// 17. AUTOMATION RUNS
+// 17. AUTOMATION RUNS (Composite FK on optional campaign_id)
 // ============================================================================
 
 export const automationRuns = pgTable(
@@ -789,11 +951,16 @@ export const automationRuns = pgTable(
       columns: [table.organizationId, table.ruleId],
       foreignColumns: [automationRules.organizationId, automationRules.id],
     }).onDelete("cascade"),
+    foreignKey({
+      name: "automation_runs_org_campaign_fk",
+      columns: [table.organizationId, table.campaignId],
+      foreignColumns: [campaigns.organizationId, campaigns.id],
+    }).onDelete("cascade"),
   ]
 );
 
 // ============================================================================
-// 18. APPROVALS
+// 18. APPROVALS (Bound to immutable SHA-256 actionPayloadHash)
 // ============================================================================
 
 export const approvals = pgTable(
@@ -810,6 +977,7 @@ export const approvals = pgTable(
     reviewedByUserId: uuid("reviewed_by_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
+    actionPayloadHash: varchar("action_payload_hash", { length: 64 }).notNull(),
     status: approvalStatusEnum("status").default("PENDING").notNull(),
     decisionNotes: text("decision_notes"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
@@ -897,7 +1065,7 @@ export const auditLogs = pgTable(
     actorUserId: uuid("actor_user_id").references(() => users.id, {
       onDelete: "set null",
     }),
-    actorType: varchar("actor_type", { length: 32 }).notNull(), // USER | SYSTEM | AUTOMATION | AI_ADVISOR
+    actorType: varchar("actor_type", { length: 32 }).notNull(),
     action: varchar("action", { length: 120 }).notNull(),
     entityType: varchar("entity_type", { length: 64 }).notNull(),
     entityId: varchar("entity_id", { length: 120 }).notNull(),
@@ -984,6 +1152,53 @@ export const notifications = pgTable(
   ]
 );
 
+// ============================================================================
+// 23. SYNC RUNS (Incremental Synchronization Checkpoints & Concurrency)
+// ============================================================================
+
+export const syncRuns = pgTable(
+  "sync_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    organizationId: uuid("organization_id")
+      .notNull()
+      .references(() => organizations.id, { onDelete: "cascade" }),
+    integrationId: uuid("integration_id").notNull(),
+    adAccountId: uuid("ad_account_id"),
+    provider: adProviderEnum("provider").notNull(),
+    status: syncRunStatusEnum("status").default("RUNNING").notNull(),
+    checkpointToken: varchar("checkpoint_token", { length: 255 }),
+    entitiesSynced: jsonb("entities_synced")
+      .$type<Record<string, number>>()
+      .default({})
+      .notNull(),
+    errorCode: varchar("error_code", { length: 80 }),
+    errorMessage: text("error_message"),
+    isDemoData: boolean("is_demo_data").default(false).notNull(),
+    startedAt: timestamp("started_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("sync_runs_org_id_unique").on(table.organizationId, table.id),
+    index("sync_runs_org_integration_idx").on(
+      table.organizationId,
+      table.integrationId
+    ),
+    foreignKey({
+      name: "sync_runs_org_integration_fk",
+      columns: [table.organizationId, table.integrationId],
+      foreignColumns: [integrations.organizationId, integrations.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "sync_runs_org_ad_account_fk",
+      columns: [table.organizationId, table.adAccountId],
+      foreignColumns: [adAccounts.organizationId, adAccounts.id],
+    }).onDelete("cascade"),
+  ]
+);
+
 export const ALL_DOMAIN_TABLES = [
   "organizations",
   "users",
@@ -1011,8 +1226,10 @@ export const ALL_DOMAIN_TABLES = [
 
 export const TENANT_SCOPED_TABLES = [
   "memberships",
+  "member_client_access",
   "clients",
   "integrations",
+  "oauth_states",
   "ad_accounts",
   "campaigns",
   "ad_groups",
@@ -1030,4 +1247,5 @@ export const TENANT_SCOPED_TABLES = [
   "audit_logs",
   "reports",
   "notifications",
+  "sync_runs",
 ] as const;

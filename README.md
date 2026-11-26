@@ -32,10 +32,10 @@ Diferente de ferramentas que executam alterações opacas em contas de anúncio,
 | **Visualização & Tabelas** | Recharts, TanStack Table v8 |
 | **Formulários & Validação** | React Hook Form, Zod v4 |
 | **Banco de Dados & ORM** | Neon PostgreSQL (`@neondatabase/serverless`), Drizzle ORM 0.45, Drizzle Kit |
-| **Autenticação** | Auth.js v5 (`next-auth@5.0.0-beta.32` — Contratos prontos; ativação completa na Etapa 2) |
+| **Autenticação** | Auth.js v5 (`next-auth@5.0.0-beta.32`) + Sessões e Rate Limiting Persistentes no PostgreSQL (`/login`, `/onboarding`, Middleware) |
 | **Inteligência Artificial** | Vercel AI SDK v6 (Abstração multi-modelo com saída estruturada) |
 | **Automação & Jobs** | Vercel Cron, Vercel Workflow SDK Architecture |
-| **Qualidade & Testes** | ESLint 9, Vitest 4, PGlite (Disposable PostgreSQL RLS Tests), Playwright E2E |
+| **Qualidade & Testes** | ESLint 9, Vitest 4, PGlite (PostgreSQL RLS & Operational Persistence), Playwright E2E + `@axe-core/playwright` |
 
 ---
 
@@ -60,6 +60,8 @@ Documentação detalhada disponível em [`docs/`](./docs/):
 - [Motor de Automações (`docs/automation-engine.md`)](./docs/automation-engine.md)
 - [Roadmap (`docs/roadmap.md`)](./docs/roadmap.md)
 - [Relatório de Hardening Foundation 1.1 (`docs/reviews/foundation-1.1-hardening-report.md`)](./docs/reviews/foundation-1.1-hardening-report.md)
+- [Relatório Etapa 2.0 — Auth, Multi-Tenancy & Google Ads Read-Only (`docs/reviews/stage-2-auth-multitenancy-google-ads-report.md`)](./docs/reviews/stage-2-auth-multitenancy-google-ads-report.md)
+- [Relatório Etapa 2.1 — Operational Completion (`docs/reviews/stage-2.1-operational-completion-report.md`)](./docs/reviews/stage-2.1-operational-completion-report.md)
 - [ADRs (`docs/adr/`)](./docs/adr/)
 
 ---

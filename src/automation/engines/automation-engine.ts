@@ -21,6 +21,7 @@ import {
   assertTenantAccess,
   hasPermission,
 } from "@/security/rbac-and-tenant";
+import { computeActionPayloadHash } from "@/security/vault-and-guards";
 
 // ============================================================================
 // DOMAIN CONTRACTS & PERSISTENCE STORES (DURABLE / INJECTABLE PORTS)
@@ -62,11 +63,46 @@ export interface ApprovalRecord {
   readonly recommendationId: string;
   readonly campaignId: string;
   readonly actionType: CampaignMutationRequest["actionType"];
+  /**
+   * Immutable SHA-256 hash of (organizationId, campaignId, actionType, canonicalJson(payload)).
+   * Prevents payload tampering after approval is granted.
+   */
+  readonly actionPayloadHash: string;
   readonly status: ApprovalStatus;
   readonly approvedByUserId: string;
   readonly approverRole: UserRole;
   readonly expiresAt: string;
   readonly approvedAt?: string;
+}
+
+export function createPayloadBoundApprovalRecord(params: {
+  readonly id: string;
+  readonly recommendationId: string;
+  readonly request: CampaignMutationRequest;
+  readonly approvedByUserId: string;
+  readonly approverRole: UserRole;
+  readonly status?: ApprovalStatus;
+  readonly expiresAt?: string;
+}): ApprovalRecord {
+  return {
+    id: params.id,
+    organizationId: params.request.organizationId,
+    recommendationId: params.recommendationId,
+    campaignId: params.request.campaignId,
+    actionType: params.request.actionType,
+    actionPayloadHash: computeActionPayloadHash({
+      organizationId: params.request.organizationId,
+      campaignId: params.request.campaignId,
+      actionType: params.request.actionType,
+      payload: params.request.payload,
+    }),
+    status: params.status ?? "APPROVED",
+    approvedByUserId: params.approvedByUserId,
+    approverRole: params.approverRole,
+    expiresAt:
+      params.expiresAt ?? new Date(Date.now() + 3600_000).toISOString(),
+    approvedAt: new Date().toISOString(),
+  };
 }
 
 export interface AuditLogEntry {
@@ -112,7 +148,7 @@ export interface AuditLogStore {
 }
 
 // ============================================================================
-// DEFAULT IN-MEMORY ADAPTERS FOR FOUNDATION 1.1 & DETERMINISTIC TESTING
+// DEFAULT IN-MEMORY ADAPTERS FOR DETERMINISTIC TESTING
 // ============================================================================
 
 export class InMemoryIdempotencyStore implements IdempotencyStore {
@@ -410,7 +446,6 @@ export class RuleEngine {
     assertTenantAccess(context, rule.organizationId);
     assertTenantAccess(context, campaign.organizationId);
 
-    // 1. Disabled Rule Guard (Phase D Fix #1)
     if (!rule.isEnabled) {
       return {
         matched: false,
@@ -421,7 +456,6 @@ export class RuleEngine {
       };
     }
 
-    // 2. Content Policy Guard
     const contentPolicy = this.policyEngine.validateCampaignContent(
       campaign.name
     );
@@ -435,7 +469,6 @@ export class RuleEngine {
       };
     }
 
-    // 3. Financial Limit Guardrail (checked early before metric matching)
     const deltaPct = rule.proposedAction.budgetDeltaPct ?? 0;
     const financialPolicy = this.policyEngine.validateFinancialLimit(
       deltaPct,
@@ -452,7 +485,6 @@ export class RuleEngine {
       };
     }
 
-    // 4. Dynamic Time Window Resolution (Phase D Fix #2)
     const windowMetrics = this.resolveMetricsForWindow(
       campaign,
       rule.timeWindowDays
@@ -468,7 +500,6 @@ export class RuleEngine {
       };
     }
 
-    // 5. Minimum Statistical Data Guardrails
     if (
       windowMetrics.impressions < rule.minImpressions ||
       windowMetrics.clicks < rule.minClicks ||
@@ -484,7 +515,6 @@ export class RuleEngine {
       };
     }
 
-    // 6. Cooldown Guardrail
     if (campaign.lastAutomatedChangeAt) {
       const lastChangeMs = new Date(campaign.lastAutomatedChangeAt).getTime();
       const elapsedMinutes = (now.getTime() - lastChangeMs) / (1000 * 60);
@@ -500,7 +530,6 @@ export class RuleEngine {
       }
     }
 
-    // 7. Composite Metric Condition Evaluation over the configured window
     const cpaExceeded =
       rule.condition.maxAllowedCpaBrl !== undefined &&
       windowMetrics.cpaBrl > rule.condition.maxAllowedCpaBrl;
@@ -544,14 +573,14 @@ export class SimulationEngine {
 }
 
 // ============================================================================
-// ENGINE 5: APPROVAL ENGINE (Structured Approval Validation)
+// ENGINE 5: APPROVAL ENGINE (Payload-Bound Cryptographic Approval Validation)
 // ============================================================================
 
 export class ApprovalEngine {
   public validateApproval(
     context: TenantContext,
     request: CampaignMutationRequest,
-    approval?: ApprovalRecord | null,
+    approval: ApprovalRecord | null | undefined,
     now: Date = new Date()
   ): { valid: boolean; reason?: string } {
     if (!approval) {
@@ -606,6 +635,24 @@ export class ApprovalEngine {
       };
     }
 
+    const expectedPayloadHash = computeActionPayloadHash({
+      organizationId: request.organizationId,
+      campaignId: request.campaignId,
+      actionType: request.actionType,
+      payload: request.payload,
+    });
+
+    if (
+      !approval.actionPayloadHash ||
+      approval.actionPayloadHash !== expectedPayloadHash
+    ) {
+      return {
+        valid: false,
+        reason:
+          "ApprovalRecord actionPayloadHash mismatch: request payload was modified after approval was signed.",
+      };
+    }
+
     return { valid: true };
   }
 }
@@ -629,7 +676,7 @@ export class AuditEngine {
 }
 
 // ============================================================================
-// ENGINE 7: EXECUTION ENGINE (Idempotency, Kill Switch, Verification, Circuit Breaker)
+// ENGINE 7: EXECUTION ENGINE (No Boolean Bypass, Mandatory Reconciliation)
 // ============================================================================
 
 export class AutomationExecutionError extends Error {
@@ -729,15 +776,13 @@ export class SupervisedExecutionEngine {
     context: TenantContext;
     provider: AdvertisingExecutionProvider;
     request: CampaignMutationRequest;
-    isExplicitlyApproved?: boolean;
-    approval?: ApprovalRecord;
+    approval: ApprovalRecord;
     now?: Date;
   }): Promise<MutationExecutionResult> {
     const {
       context,
       provider,
       request,
-      isExplicitlyApproved,
       approval,
       now = new Date(),
     } = params;
@@ -751,11 +796,11 @@ export class SupervisedExecutionEngine {
     assertTenantAccess(context, request.organizationId);
     assertPermission(context, "automation:approve_execution");
 
-    // 2. Foundation 1.1 Safety Gate: Block real non-simulated providers
+    // 2. Safety Gate: Block real non-simulated providers
     if (!provider.isSimulated) {
       throw new AutomationExecutionError(
         "NON_SIMULATED_PROVIDER_BLOCKED",
-        `Provider '${provider.providerType}' is not simulated. Real ad platform execution is strictly blocked in Foundation 1.1.`
+        `Provider '${provider.providerType}' is not simulated. Real ad platform execution is strictly blocked.`
       );
     }
 
@@ -786,24 +831,17 @@ export class SupervisedExecutionEngine {
       );
     }
 
-    // 5. Structured Approval Engine Validation
-    if (approval !== undefined) {
-      const approvalCheck = this.approvalEngine.validateApproval(
-        context,
-        request,
-        approval,
-        now
-      );
-      if (!approvalCheck.valid) {
-        throw new AutomationExecutionError(
-          "INVALID_APPROVAL_RECORD",
-          approvalCheck.reason ?? "Invalid approval record."
-        );
-      }
-    } else if (!isExplicitlyApproved) {
+    // 5. Mandatory Payload-Bound ApprovalRecord Validation (Boolean bypass removed)
+    const approvalCheck = this.approvalEngine.validateApproval(
+      context,
+      request,
+      approval,
+      now
+    );
+    if (!approvalCheck.valid) {
       throw new AutomationExecutionError(
-        "APPROVAL_REQUIRED",
-        "Explicit human approval is mandatory before executing campaign changes."
+        "INVALID_APPROVAL_RECORD",
+        approvalCheck.reason ?? "Invalid approval record."
       );
     }
 
@@ -845,17 +883,23 @@ export class SupervisedExecutionEngine {
         "VERIFYING"
       );
 
-      // 9. Independent Post-Execution Verification (Phase D Fix #8)
-      if (provider.verifyMutation) {
-        const verification = await provider.verifyMutation(request, result);
-        if (!verification.verified) {
-          RecommendationStateMachine.transition(lifecycleState, "FAILED");
-          throw new AutomationExecutionError(
-            "POST_EXECUTION_VERIFICATION_FAILED",
-            verification.discrepancyReason ??
-              "Independent post-execution verification failed."
-          );
-        }
+      // 9. Mandatory Post-Execution Verification & Reconciliation
+      if (!provider.verifyMutation) {
+        RecommendationStateMachine.transition(lifecycleState, "FAILED");
+        throw new AutomationExecutionError(
+          "POST_EXECUTION_VERIFICATION_FAILED",
+          `Provider '${provider.providerType}' does not implement mandatory post-execution verification (verifyMutation).`
+        );
+      }
+
+      const verification = await provider.verifyMutation(request, result);
+      if (!verification.verified) {
+        RecommendationStateMachine.transition(lifecycleState, "FAILED");
+        throw new AutomationExecutionError(
+          "POST_EXECUTION_VERIFICATION_FAILED",
+          verification.discrepancyReason ??
+            "Independent post-execution verification failed."
+        );
       }
 
       lifecycleState = RecommendationStateMachine.transition(
@@ -877,10 +921,10 @@ export class SupervisedExecutionEngine {
         organizationId: context.organizationId,
         timestamp: result.executedAt,
         stage: "AUDIT",
-        actor: approval?.approvedByUserId ?? context.userId,
+        actor: approval.approvedByUserId,
         action: request.actionType,
         campaignId: request.campaignId,
-        details: `State ${lifecycleState}: Executed & verified via ${provider.providerType} (tx: ${result.externalTransactionId})`,
+        details: `State ${lifecycleState}: Executed & verified via ${provider.providerType} (tx: ${result.externalTransactionId}, payloadHash: ${approval.actionPayloadHash.slice(0, 12)})`,
         newState: result.verifiedState,
       });
 

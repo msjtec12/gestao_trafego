@@ -1,12 +1,14 @@
 "use client";
 
 import * as React from "react";
+import Image from "next/image";
 import {
   LayoutDashboard,
   Megaphone,
   Sparkles,
   Cpu,
   Database,
+  Building2,
   PanelLeftClose,
   PanelLeftOpen,
 } from "lucide-react";
@@ -20,7 +22,12 @@ export interface NavItem {
 
 export const DASHBOARD_NAV_ITEMS: readonly NavItem[] = [
   { id: "overview", label: "Visão Geral & KPIs", icon: LayoutDashboard },
-  { id: "campaigns", label: "Campanhas (Mock Demo)", icon: Megaphone },
+  {
+    id: "tenant-management-hub",
+    label: "Gestão Multi-Tenant & Contas",
+    icon: Building2,
+  },
+  { id: "campaigns", label: "Campanhas & Métricas", icon: Megaphone },
   { id: "ai-recommendations", label: "IA Supervisionada", icon: Sparkles },
   { id: "automation-engine", label: "Motor de Automações", icon: Cpu },
   {
@@ -37,6 +44,7 @@ export interface AppSidebarProps {
   readonly onSelectSection: (sectionId: string) => void;
   readonly organizationName: string;
   readonly organizationId: string;
+  readonly isDemoEnvironment?: boolean;
 }
 
 export function AppSidebar({
@@ -46,6 +54,7 @@ export function AppSidebar({
   onSelectSection,
   organizationName,
   organizationId,
+  isDemoEnvironment = true,
 }: AppSidebarProps) {
   return (
     <aside
@@ -56,16 +65,21 @@ export function AppSidebar({
     >
       <div className="h-16 flex items-center justify-between px-4 border-b border-slate-200 dark:border-slate-800/90">
         <div className="flex items-center gap-3 overflow-hidden">
-          <div
-            className="h-9 w-9 rounded-lg bg-cyan-500/15 border border-cyan-500/40 flex items-center justify-center text-cyan-600 dark:text-cyan-400 font-bold shrink-0"
-            aria-hidden="true"
-          >
-            K
+          <div className="h-10 w-10 rounded-lg overflow-hidden border border-cyan-500/40 bg-[#060d1a] flex items-center justify-center shrink-0">
+            <Image
+              src="/konnexy-logo.jpg"
+              alt="Logo Oficial Konnexy Ads"
+              width={40}
+              height={40}
+              className="object-cover h-full w-full"
+              priority
+            />
           </div>
           {!collapsed && (
             <div className="leading-tight">
               <span className="font-bold text-sm tracking-tight block text-slate-900 dark:text-white">
-                KONNEXY <span className="text-cyan-500 dark:text-cyan-400">ADS</span>
+                KONNEXY{" "}
+                <span className="text-cyan-500 dark:text-cyan-400">ADS</span>
               </span>
               <span className="text-[11px] text-slate-500 dark:text-slate-400 block">
                 ads.konnexy.com.br
@@ -119,9 +133,11 @@ export function AppSidebar({
         <div className="p-4 m-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100/70 dark:bg-slate-900/70 space-y-2 text-xs">
           <div className="flex items-center justify-between">
             <span className="text-slate-500 dark:text-slate-400">
-              Contexto Demo
+              Tenant Ativo
             </span>
-            <Badge variant="demo">MOCK TENANT</Badge>
+            <Badge variant={isDemoEnvironment ? "demo" : "default"}>
+              {isDemoEnvironment ? "MOCK TENANT" : "OPERACIONAL"}
+            </Badge>
           </div>
           <p className="font-semibold text-slate-800 dark:text-slate-200 truncate">
             {organizationName}

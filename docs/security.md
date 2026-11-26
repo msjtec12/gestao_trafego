@@ -12,8 +12,11 @@ O Konnexy Ads implementa RBAC estrito por organização (`memberships.role`) com
 | `ANALYST` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
 | `CLIENT_VIEWER` | ✅ (Restrito a `allowedClientIds`) | ❌ | ❌ | ❌ | ❌ | ❌ |
 
-- **Autorização em Nível de Cliente (`assertClientScopeAccess`)**: Usuários com papel `CLIENT_VIEWER` exigem uma lista explícita `allowedClientIds` no contexto da sessão e são bloqueados caso tentem acessar recursos de outro cliente da mesma organização.
-- **Estado do Auth.js na Foundation 1.1**: A dependência `next-auth` foi atualizada para `5.0.0-beta.32` (corrigindo advisories críticos de versões anteriores a `beta.32`). A autenticação interativa completa permanece planejada para a Etapa 2, sem simular sessão falsa como se fosse autenticação real em produção.
+- **Autorização em Nível de Cliente (`assertClientScopeAccess`)**: Usuários com papel `CLIENT_VIEWER` exigem uma lista explícita `allowedClientIds` populada a partir da tabela PostgreSQL `member_client_access` e são bloqueados caso tentem acessar recursos de outro cliente da mesma organização.
+- **Autenticação Operacional Persistente (Etapa 2.1)**:
+  - Sessões autenticadas são persistidas na tabela `user_sessions` (com verificação de expiração e revogação imediata no logout).
+  - Tentativas de login falhas são contabilizadas de forma durável na tabela PostgreSQL `auth_rate_limits` (`PersistentPostgresAuthRateLimiter`), bloqueando ataques de força bruta mesmo após reinicialização do processo.
+  - O dashboard operacional (`/`) é protegido por `src/middleware.ts` e validação server-side obrigatória; o ambiente demonstrativo público fica isolado em `/demo`.
 
 ---
 

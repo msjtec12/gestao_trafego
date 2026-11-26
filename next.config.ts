@@ -16,6 +16,7 @@ const cspHeader = [
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  serverExternalPackages: ["@electric-sql/pglite"],
   headers: async () => [
     {
       source: "/(.*)",

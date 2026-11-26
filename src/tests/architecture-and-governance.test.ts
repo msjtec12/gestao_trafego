@@ -15,6 +15,7 @@ import {
   redactSensitiveData,
   validateSafeExternalUrl,
   resolveAndValidateSafeExternalUrl,
+  toPublicSafeErrorMessage,
 } from "@/security/vault-and-guards";
 import { validateServerEnv } from "@/security/env";
 import {
@@ -23,6 +24,7 @@ import {
   SupervisedExecutionEngine,
   RecommendationStateMachine,
   AutomationExecutionError,
+  createPayloadBoundApprovalRecord,
   type ApprovalRecord,
   type AutomationRuleDefinition,
 } from "@/automation/engines/automation-engine";
@@ -131,7 +133,6 @@ describe("1. Multi-Tenant Isolation & Client-Scoped Authorization Tests", () => 
       })
     ).not.toThrow();
 
-    // Cross-organization or mismatched parent-child link is rejected
     expect(() =>
       validateTenantEntityChain(ORG_A_CTX, {
         organizationId: "org-alpha-111",
@@ -182,7 +183,6 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
       false
     );
     expect(hasPermission("CLIENT_VIEWER", "ai:analyze")).toBe(false);
-    // Fail-closed for invalid role
     expect(
       hasPermission("INVALID_ROLE" as never, "dashboard:view")
     ).toBe(false);
@@ -218,7 +218,6 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
     expect(encrypted).not.toContain(secretToken);
     expect(decryptCredential(encrypted, keyRing, { aad })).toBe(secretToken);
 
-    // Tampering with AAD (different organizationId) must fail authentication tag check
     expect(() =>
       decryptCredential(encrypted, keyRing, {
         aad: {
@@ -228,11 +227,9 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
       })
     ).toThrow();
 
-    // Tampering with ciphertext must fail
     const tampered = `${encrypted.slice(0, -2)}ff`;
     expect(() => decryptCredential(tampered, keyRing, { aad })).toThrow();
 
-    // All-zero weak key must be rejected
     expect(() =>
       encryptCredential(
         secretToken,
@@ -241,7 +238,7 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
     ).toThrow(/weak or all-zero key entropy/);
   });
 
-  it("redacts sensitive tokens, inline Bearer tokens, and handles circular references safely", () => {
+  it("redacts sensitive tokens, inline Bearer tokens, circular references, and sanitizes internal error messages", () => {
     const circularObj: Record<string, unknown> = {
       organizationId: "org-alpha-111",
       accessToken: "secret-access-token",
@@ -261,9 +258,20 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
       (sanitized.nested as Record<string, unknown>).refreshToken
     ).toBe("[REDACTED]");
     expect(sanitized.self).toBe("[CIRCULAR_REF]");
+
+    // Verify internal SQL / connection string leak is scrubbed from public error message
+    const internalDbErr = new Error(
+      "Connection failed to postgresql://neondb_owner:supersecret@ep-host.neon.tech/db"
+    );
+    const safeError = toPublicSafeErrorMessage(
+      internalDbErr,
+      "Erro seguro exibido ao usuário."
+    );
+    expect(safeError.publicMessage).toBe("Erro seguro exibido ao usuário.");
+    expect(safeError.publicMessage).not.toContain("supersecret");
   });
 
-  it("blocks SSRF attempts targeting localhost, private IPv4/IPv6, DNS rebinding, and redirect chains", async () => {
+  it("blocks SSRF attempts targeting localhost, private IPv4/IPv6, non-443 ports, DNS rebinding, and pins transport IP", async () => {
     expect(() => validateSafeExternalUrl("http://example.com")).toThrow(
       /Only HTTPS/
     );
@@ -276,15 +284,16 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
     expect(() => validateSafeExternalUrl("https://[::1]/internal")).toThrow(
       /SSRF Guard/
     );
+    expect(() =>
+      validateSafeExternalUrl("https://ads.konnexy.com.br:8443/internal")
+    ).toThrow(/Non-standard HTTPS port/);
 
-    // DNS Rebinding simulation: public hostname resolving to private 10.0.0.1
     await expect(
       resolveAndValidateSafeExternalUrl("https://evil-rebind.example.com", {
         dnsResolver: async () => [{ address: "10.0.0.1", family: 4 }],
       })
     ).rejects.toThrow(/DNS rebinding protection/);
 
-    // Valid public DNS resolution
     const safeResolved = await resolveAndValidateSafeExternalUrl(
       "https://ads.konnexy.com.br/landing",
       {
@@ -292,6 +301,7 @@ describe("2. RBAC, Environment Validation & Security Guards Tests", () => {
       }
     );
     expect(safeResolved.resolvedAddresses).toEqual(["76.76.21.21"]);
+    expect(safeResolved.pinnedAddress).toBe("76.76.21.21");
     expect(safeResolved.safeFetchInit.redirect).toBe("error");
   });
 
@@ -352,7 +362,7 @@ describe("3. Automated Rules, Disabled Rules, Dynamic Windows, Policy & Cooldown
   it("evaluates different configurable time windows (3d vs 30d) accurately", async () => {
     const provider = new MockAdsProvider();
     const campaigns = await provider.listCampaigns(ORG_A_CTX.organizationId);
-    const campaignWithWindows = campaigns[2]!; // 3d CPA = R$ 104.00, 30d CPA = R$ 50.00
+    const campaignWithWindows = campaigns[2]!;
 
     const rule30d: AutomationRuleDefinition = {
       ...baseRule,
@@ -363,7 +373,7 @@ describe("3. Automated Rules, Disabled Rules, Dynamic Windows, Policy & Cooldown
       rule30d,
       campaignWithWindows
     );
-    expect(out30d.matched).toBe(false); // 30d CPA (50) <= 60
+    expect(out30d.matched).toBe(false);
     expect(out30d.evaluatedWindowDays).toBe(30);
 
     const rule3d: AutomationRuleDefinition = {
@@ -378,16 +388,16 @@ describe("3. Automated Rules, Disabled Rules, Dynamic Windows, Policy & Cooldown
       rule3d,
       campaignWithWindows
     );
-    expect(out3d.matched).toBe(true); // 3d CPA (104) > 60
+    expect(out3d.matched).toBe(true);
     expect(out3d.evaluatedWindowDays).toBe(3);
   });
 
   it("rejects invalid financial parameters (NaN, Infinity, -100%, or exceeding maxBudgetChangePct)", () => {
     const policy = new PolicyEngine();
     expect(policy.validateFinancialLimit(Number.NaN, 20).allowed).toBe(false);
-    expect(policy.validateFinancialLimit(Number.POSITIVE_INFINITY, 20).allowed).toBe(
-      false
-    );
+    expect(
+      policy.validateFinancialLimit(Number.POSITIVE_INFINITY, 20).allowed
+    ).toBe(false);
     expect(policy.validateFinancialLimit(-100, 20).allowed).toBe(false);
     expect(policy.validateFinancialLimit(25, 20).allowed).toBe(false);
     expect(policy.validateFinancialLimit(15, 20, 150).allowed).toBe(true);
@@ -467,7 +477,7 @@ describe("3. Automated Rules, Disabled Rules, Dynamic Windows, Policy & Cooldown
   });
 });
 
-describe("4. Structured Approvals, Concurrent Idempotency, Read-Only & Kill Switch Tests", () => {
+describe("4. Payload-Bound Approvals, Concurrent Idempotency, Read-Only & Kill Switch Tests", () => {
   const sampleMutation: CampaignMutationRequest = {
     organizationId: ORG_A_CTX.organizationId,
     campaignId: "camp-demo-03",
@@ -476,17 +486,13 @@ describe("4. Structured Approvals, Concurrent Idempotency, Read-Only & Kill Swit
     idempotencyKey: "idem-key-unique-001",
   };
 
-  const validApproval: ApprovalRecord = {
+  const validApproval: ApprovalRecord = createPayloadBoundApprovalRecord({
     id: "app-001",
-    organizationId: ORG_A_CTX.organizationId,
     recommendationId: "rec-001",
-    campaignId: "camp-demo-03",
-    actionType: "ADJUST_DAILY_BUDGET",
-    status: "APPROVED",
+    request: sampleMutation,
     approvedByUserId: "user-owner-01",
     approverRole: "OWNER",
-    expiresAt: new Date(Date.now() + 3600_000).toISOString(),
-  };
+  });
 
   it("blocks execution when organization is in default READ_ONLY mode", async () => {
     const engine = new SupervisedExecutionEngine();
@@ -535,7 +541,7 @@ describe("4. Structured Approvals, Concurrent Idempotency, Read-Only & Kill Swit
     ).rejects.toThrow(/Emergency Kill Switch is active/);
   });
 
-  it("rejects expired, mismatched, or unauthorized ApprovalRecord objects", async () => {
+  it("rejects expired, mismatched, or payload-tampered ApprovalRecord objects", async () => {
     const engine = new SupervisedExecutionEngine();
     const provider = new MockAdsProvider();
 
@@ -564,6 +570,20 @@ describe("4. Structured Approvals, Concurrent Idempotency, Read-Only & Kill Swit
         approval: mismatchedCampaignApproval,
       })
     ).rejects.toThrow(/does not match request campaignId/);
+
+    // Tamper with payload after approval was signed -> actionPayloadHash mismatch
+    const tamperedRequest: CampaignMutationRequest = {
+      ...sampleMutation,
+      payload: { proposedDailyBudgetBrl: 9999, changePct: -10 },
+    };
+    await expect(
+      engine.executeApprovedMutation({
+        context: ORG_A_CTX,
+        provider,
+        request: tamperedRequest,
+        approval: validApproval,
+      })
+    ).rejects.toThrow(/actionPayloadHash mismatch/);
   });
 
   it("enforces concurrent idempotency when two simultaneous requests share the same idempotencyKey", async () => {
@@ -601,36 +621,52 @@ describe("5. Integration Failures, Reconciliation Verification, State Machine, D
     const engine = new SupervisedExecutionEngine();
 
     for (let i = 1; i <= 3; i++) {
+      const req: CampaignMutationRequest = {
+        organizationId: ORG_A_CTX.organizationId,
+        campaignId: "camp-demo-01",
+        actionType: "PAUSE_CAMPAIGN",
+        payload: { reason: "CPA spike" },
+        idempotencyKey: `fail-key-${i}`,
+      };
+      const approval = createPayloadBoundApprovalRecord({
+        id: `app-fail-${i}`,
+        recommendationId: "rec-fail",
+        request: req,
+        approvedByUserId: ORG_A_CTX.userId,
+        approverRole: "OWNER",
+      });
+
       await expect(
         engine.executeApprovedMutation({
           context: ORG_A_CTX,
           provider: failingProvider,
-          request: {
-            organizationId: ORG_A_CTX.organizationId,
-            campaignId: "camp-demo-01",
-            actionType: "PAUSE_CAMPAIGN",
-            payload: { reason: "CPA spike" },
-            idempotencyKey: `fail-key-${i}`,
-          },
-          isExplicitlyApproved: true,
+          request: req,
+          approval,
         })
       ).rejects.toThrow(ProviderIntegrationError);
     }
 
     expect(engine.isCircuitOpen()).toBe(true);
 
+    const req4: CampaignMutationRequest = {
+      organizationId: ORG_A_CTX.organizationId,
+      campaignId: "camp-demo-01",
+      actionType: "PAUSE_CAMPAIGN",
+      payload: { reason: "CPA spike" },
+      idempotencyKey: "fail-key-4",
+    };
     await expect(
       engine.executeApprovedMutation({
         context: ORG_A_CTX,
         provider: new MockAdsProvider(),
-        request: {
-          organizationId: ORG_A_CTX.organizationId,
-          campaignId: "camp-demo-01",
-          actionType: "PAUSE_CAMPAIGN",
-          payload: { reason: "CPA spike" },
-          idempotencyKey: "fail-key-4",
-        },
-        isExplicitlyApproved: true,
+        request: req4,
+        approval: createPayloadBoundApprovalRecord({
+          id: "app-fail-4",
+          recommendationId: "rec-fail",
+          request: req4,
+          approvedByUserId: ORG_A_CTX.userId,
+          approverRole: "OWNER",
+        }),
       })
     ).rejects.toThrow(/Circuit breaker is OPEN/);
   });
@@ -640,19 +676,26 @@ describe("5. Integration Failures, Reconciliation Verification, State Machine, D
       simulateFailure: "VERIFICATION_MISMATCH",
     });
     const engine = new SupervisedExecutionEngine();
+    const req: CampaignMutationRequest = {
+      organizationId: ORG_A_CTX.organizationId,
+      campaignId: "camp-demo-01",
+      actionType: "PAUSE_CAMPAIGN",
+      payload: { reason: "Drift test" },
+      idempotencyKey: "drift-key-1",
+    };
 
     await expect(
       engine.executeApprovedMutation({
         context: ORG_A_CTX,
         provider: driftProvider,
-        request: {
-          organizationId: ORG_A_CTX.organizationId,
-          campaignId: "camp-demo-01",
-          actionType: "PAUSE_CAMPAIGN",
-          payload: { reason: "Drift test" },
-          idempotencyKey: "drift-key-1",
-        },
-        isExplicitlyApproved: true,
+        request: req,
+        approval: createPayloadBoundApprovalRecord({
+          id: "app-drift-1",
+          recommendationId: "rec-drift",
+          request: req,
+          approvedByUserId: ORG_A_CTX.userId,
+          approverRole: "OWNER",
+        }),
       })
     ).rejects.toThrow(/state drift/);
   });
@@ -675,18 +718,25 @@ describe("5. Integration Failures, Reconciliation Verification, State Machine, D
     );
 
     const engine = new SupervisedExecutionEngine();
+    const req: CampaignMutationRequest = {
+      organizationId: ORG_A_CTX.organizationId,
+      campaignId: "camp-demo-01",
+      actionType: "PAUSE_CAMPAIGN",
+      payload: { reason: "Test real block" },
+      idempotencyKey: "real-provider-block-1",
+    };
     await expect(
       engine.executeApprovedMutation({
         context: ORG_A_CTX,
         provider: googleProvider,
-        request: {
-          organizationId: ORG_A_CTX.organizationId,
-          campaignId: "camp-demo-01",
-          actionType: "PAUSE_CAMPAIGN",
-          payload: { reason: "Test real block" },
-          idempotencyKey: "real-provider-block-1",
-        },
-        isExplicitlyApproved: true,
+        request: req,
+        approval: createPayloadBoundApprovalRecord({
+          id: "app-real-1",
+          recommendationId: "rec-real",
+          request: req,
+          approvedByUserId: ORG_A_CTX.userId,
+          approverRole: "OWNER",
+        }),
       })
     ).rejects.toThrow(/Real ad platform execution is strictly blocked/);
   });
