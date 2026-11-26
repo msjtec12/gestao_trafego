@@ -1,5 +1,4 @@
 import fs from "fs";
-import path from "path";
 import { neon, Pool } from "@neondatabase/serverless";
 import { drizzle as drizzleHttp, type NeonHttpDatabase } from "drizzle-orm/neon-http";
 import {
@@ -14,6 +13,10 @@ import { PGlite } from "@electric-sql/pglite";
 import { sql } from "drizzle-orm";
 import type { TenantContext } from "@/domain/types";
 import { UnauthenticatedAccessError } from "@/security/session-guard";
+import {
+  loadOfficialDrizzleMigrations,
+  reconcileMigrationTrackingTables,
+} from "./migration-reconciler";
 import * as schema from "./schema";
 
 export type SchemaType = typeof schema;
@@ -151,75 +154,56 @@ export function createDbClient(connectionString?: string): NeonHttpDatabase<Sche
 
 export type DatabaseClient = ReturnType<typeof createDbClient>;
 
-const MIGRATION_FILES = [
-  "0000_confused_galactus.sql",
-  "0001_multi_tenant_rls_hardening.sql",
-  "0002_stage2_auth_rls_and_sync.sql",
-  "0003_stage2_1_operational_persistence.sql",
-] as const;
-
+/**
+ * Applies pending migrations from `drizzle/migrations/meta/_journal.json` to PGlite,
+ * reconciling `_konnexy_migrations` and `drizzle.__drizzle_migrations` so already
+ * applied files are never executed twice.
+ */
 export async function applyAllMigrationsToPglite(pg: PGlite): Promise<void> {
-  await pg.exec(`
-    CREATE TABLE IF NOT EXISTS "_konnexy_migrations" (
-      "filename" varchar(255) PRIMARY KEY NOT NULL,
-      "applied_at" timestamp with time zone DEFAULT now() NOT NULL
-    );
-  `);
+  const reconciliation = await reconcileMigrationTrackingTables(pg);
+  const pendingSet = new Set(reconciliation.pendingFilenames);
+  const descriptors = loadOfficialDrizzleMigrations();
 
-  for (const filename of MIGRATION_FILES) {
-    const check = await pg.query<{ filename: string }>(
-      `SELECT filename FROM "_konnexy_migrations" WHERE filename = $1`,
-      [filename]
-    );
-    if (check.rows.length > 0) {
+  for (const mig of descriptors) {
+    if (!pendingSet.has(mig.filename)) {
       continue;
     }
 
-    const fullPath = path.resolve(
-      process.cwd(),
-      "drizzle/migrations",
-      filename
-    );
-    const sqlContent = fs.readFileSync(fullPath, "utf8");
-    await pg.exec(sqlContent);
+    await pg.exec(mig.sqlContent);
     await pg.query(
-      `INSERT INTO "_konnexy_migrations" (filename) VALUES ($1)`,
-      [filename]
+      `INSERT INTO "_konnexy_migrations" ("filename") VALUES ($1) ON CONFLICT ("filename") DO NOTHING`,
+      [mig.filename]
+    );
+    await pg.query(
+      `INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at") SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM "drizzle"."__drizzle_migrations" WHERE "hash" = $1)`,
+      [mig.hash, mig.when]
     );
   }
 }
 
 /**
- * Applies all SQL migrations to a live Neon PostgreSQL database using a Pool connection.
- * Used exclusively by authorized disposable Neon integration test suites or migration runners.
+ * Applies pending migrations from `drizzle/migrations/meta/_journal.json` to a
+ * disposable Neon PostgreSQL Pool, reconciling `_konnexy_migrations` with
+ * `drizzle.__drizzle_migrations` first so already executed migrations are skipped.
  */
 export async function applyAllMigrationsToNeonPool(pool: Pool): Promise<void> {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS "_konnexy_migrations" (
-      "filename" varchar(255) PRIMARY KEY NOT NULL,
-      "applied_at" timestamp with time zone DEFAULT now() NOT NULL
-    );
-  `);
+  const reconciliation = await reconcileMigrationTrackingTables(pool);
+  const pendingSet = new Set(reconciliation.pendingFilenames);
+  const descriptors = loadOfficialDrizzleMigrations();
 
-  for (const filename of MIGRATION_FILES) {
-    const check = await pool.query<{ filename: string }>(
-      `SELECT filename FROM "_konnexy_migrations" WHERE filename = $1`,
-      [filename]
-    );
-    if (check.rows.length > 0) {
+  for (const mig of descriptors) {
+    if (!pendingSet.has(mig.filename)) {
       continue;
     }
 
-    const fullPath = path.resolve(
-      process.cwd(),
-      "drizzle/migrations",
-      filename
-    );
-    const sqlContent = fs.readFileSync(fullPath, "utf8");
-    await pool.query(sqlContent);
+    await pool.query(mig.sqlContent);
     await pool.query(
-      `INSERT INTO "_konnexy_migrations" (filename) VALUES ($1)`,
-      [filename]
+      `INSERT INTO "_konnexy_migrations" ("filename") VALUES ($1) ON CONFLICT ("filename") DO NOTHING`,
+      [mig.filename]
+    );
+    await pool.query(
+      `INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at") SELECT $1, $2 WHERE NOT EXISTS (SELECT 1 FROM "drizzle"."__drizzle_migrations" WHERE "hash" = $1)`,
+      [mig.hash, mig.when]
     );
   }
 }

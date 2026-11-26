@@ -10,6 +10,12 @@ import {
   onboardFirstOrganizationRepository,
   PersistentDrizzleTenantRepository,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
+import {
+  generateDrizzleReconciliationSql,
+  loadOfficialDrizzleMigrations,
+  reconcileMigrationTrackingTables,
+} from "@/infrastructure/db/migration-reconciler";
+import { applyAllMigrationsToPglite } from "@/infrastructure/db";
 import type { TenantContext } from "@/domain/types";
 
 describe("PostgreSQL Real Disposable DB Integration — RLS, Composite FKs, Table Grants & Drizzle Repositories", () => {
@@ -229,5 +235,73 @@ describe("PostgreSQL Real Disposable DB Integration — RLS, Composite FKs, Tabl
     expect(viewerClients).toHaveLength(1);
     expect(viewerClients[0]?.id).toBe(client1.id);
     expect(viewerClients.some((c) => c.id === client2.id)).toBe(false);
+  });
+
+  it("reconciles _konnexy_migrations with drizzle.__drizzle_migrations without reapplying, provisions konnexy_runtime, and keeps journal complete (0000..0004)", async () => {
+    const journalMigrations = loadOfficialDrizzleMigrations();
+    expect(journalMigrations.map((m) => m.tag)).toEqual([
+      "0000_confused_galactus",
+      "0001_multi_tenant_rls_hardening",
+      "0002_stage2_auth_rls_and_sync",
+      "0003_stage2_1_operational_persistence",
+      "0004_neon_pg17_role_set_and_runtime_role",
+    ]);
+
+    // Simulate a Neon staging/production DB where 0000..0003 were already applied and recorded only in _konnexy_migrations
+    await pg.exec(`
+      CREATE TABLE IF NOT EXISTS "_konnexy_migrations" (
+        "filename" varchar(255) PRIMARY KEY NOT NULL,
+        "applied_at" timestamp with time zone DEFAULT now() NOT NULL
+      );
+      INSERT INTO "_konnexy_migrations" ("filename") VALUES
+        ('0000_confused_galactus.sql'),
+        ('0001_multi_tenant_rls_hardening.sql'),
+        ('0002_stage2_auth_rls_and_sync.sql'),
+        ('0003_stage2_1_operational_persistence.sql')
+      ON CONFLICT ("filename") DO NOTHING;
+    `);
+
+    const reconciled = await reconcileMigrationTrackingTables(pg);
+    expect(reconciled.reconciledIntoDrizzle).toEqual([
+      "0000_confused_galactus.sql",
+      "0001_multi_tenant_rls_hardening.sql",
+      "0002_stage2_auth_rls_and_sync.sql",
+      "0003_stage2_1_operational_persistence.sql",
+    ]);
+    expect(reconciled.pendingFilenames).toEqual([
+      "0004_neon_pg17_role_set_and_runtime_role.sql",
+    ]);
+
+    // Apply ONLY pending 0004 via applyAllMigrationsToPglite (0000..0003 are NOT re-executed)
+    await applyAllMigrationsToPglite(pg);
+
+    // Re-running reconciliation must show 0 pending and all 5 applied in both tables
+    const postCheck = await reconcileMigrationTrackingTables(pg);
+    expect(postCheck.pendingFilenames).toEqual([]);
+    expect(postCheck.alreadyAppliedFilenames).toHaveLength(5);
+
+    // Verify konnexy_runtime least-privilege role exists with NOBYPASSRLS and NOINHERIT
+    const runtimeRole = await pg.query<{
+      rolname: string;
+      rolbypassrls: boolean;
+      rolsuper: boolean;
+      rolinherit: boolean;
+    }>(
+      `SELECT rolname, rolbypassrls, rolsuper, rolinherit FROM pg_roles WHERE rolname = 'konnexy_runtime'`
+    );
+    expect(runtimeRole.rows).toHaveLength(1);
+    expect(runtimeRole.rows[0]?.rolbypassrls).toBe(false);
+    expect(runtimeRole.rows[0]?.rolsuper).toBe(false);
+    expect(runtimeRole.rows[0]?.rolinherit).toBe(false);
+
+    // Verify reconciliation SQL generator emits idempotent non-destructive SQL
+    const sqlScript = generateDrizzleReconciliationSql(undefined, [
+      "0000_confused_galactus",
+      "0001_multi_tenant_rls_hardening",
+      "0002_stage2_auth_rls_and_sync",
+      "0003_stage2_1_operational_persistence",
+    ]);
+    expect(sqlScript).toContain('CREATE SCHEMA IF NOT EXISTS "drizzle"');
+    expect(sqlScript).not.toMatch(/DROP TABLE/i);
   });
 });

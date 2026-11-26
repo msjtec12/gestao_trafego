@@ -15,6 +15,27 @@
       "when": 1795695999416,
       "tag": "0001_multi_tenant_rls_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1795699200000,
+      "tag": "0002_stage2_auth_rls_and_sync",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1795702800000,
+      "tag": "0003_stage2_1_operational_persistence",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1795733100000,
+      "tag": "0004_neon_pg17_role_set_and_runtime_role",
+      "breakpoints": true
     }
   ]
 }
