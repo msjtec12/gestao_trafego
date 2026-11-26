@@ -117,3 +117,24 @@ A **Etapa 2.0** consolida o tratamento das ressalvas remanescentes da auditoria 
    - Mantida estritamente bloqueada (`READ_ONLY` por padrão e bloqueio `!provider.isSimulated` no `ExecutionEngine`).
 3. **Proteção da Branch `main` no GitHub**:
    - Documentada em `docs/security.md`: a branch `main` deve exigir Pull Request aprovado + status check obrigatório `Audit, Secret Scan, Lint, Typecheck, Unit, PostgreSQL RLS, Build & Playwright` antes de qualquer merge.
+
+---
+
+## 6. Errata e Pendências Reais (adicionado após re-verificação)
+
+> [!WARNING]
+> A primeira versão deste relatório afirmava que build e Playwright haviam passado. Na execução completa seguinte, o `pnpm build` falhou (`Can't resolve 'dns/promises'` / `'net'`, porque um componente cliente importava `vault-and-guards.ts`) e a suíte PostgreSQL deu timeout de hook (10s). Ambos foram corrigidos (novo módulo client-safe `src/security/public-errors.ts`; `hookTimeout` de 60s no Vitest). Resultado após a correção, com a cadeia executada em modo fail-fast: lint OK, typecheck OK, 40/40 testes OK, build OK, 7/7 Playwright OK.
+
+### Itens NÃO concluídos nesta etapa (honestidade de escopo)
+1. **Proteção de rotas**: não há `middleware.ts` nem guarda de sessão nas páginas. A página inicial continua pública (modo demonstração). Auth.js está configurado, mas nenhuma rota está protegida por ele.
+2. **Login contra o banco**: o `authorize` do Auth.js só aceita um administrador de bootstrap via `ADMIN_BOOTSTRAP_EMAIL` / `ADMIN_BOOTSTRAP_PASSWORD_HASH` (sem consulta à tabela `users`). Não há telas de login, logout nem onboarding; o onboarding existe apenas como função de repositório testada no PGlite. O `userId` do bootstrap é um UUID fixo.
+3. **Rate limiting de autenticação** é em memória por instância (não distribuído); não resiste a múltiplas instâncias serverless.
+4. **Dashboard não consome repositórios reais**: os dados exibidos (organizações, clientes, contas, membros, integrações) vêm de `getDashboardOverviewUseCase` com dados fixos de demonstração, e as ações da Central Multi-Tenant (criar cliente, selecionar conta, revogar, sincronizar) alteram apenas estado local do navegador, sem persistir nem auditar no servidor. A trilha de auditoria exibida na UI é local.
+5. **Google Ads**: `GoogleAdsReadOnlyIntegrationService` mantém o vault em memória (não persiste em `integrations`). Não há rotas de callback OAuth, nem troca de `code` por tokens, nem chamada HTTP real à Google Ads API (o transporte é injetado e foi testado só com função simulada). O pinning de IP do SSRF é feito por contexto/cabeçalho informativo; **não há um transporte HTTP que de fato conecte ao IP resolvido**. Nenhuma conexão real foi testada (sem credenciais oficiais).
+6. **Sincronização**: `IncrementalAdsSyncEngine` guarda checkpoints, métricas e lock de concorrência em memória; não grava em `sync_runs` nem nas tabelas de domínio. Persiste apenas campanhas e métricas em mapas internos; adGroups, ads, keywords, searchTerms, conversions e budgets são apenas contados. O lock não vale entre processos.
+7. **Testes ausentes ou parciais**: não há teste com o driver Neon real (apenas PGlite); a migration `0002` foi aplicada no PGlite, mas o teste de privilégios cobre apenas `DELETE` em `clients`; não há testes E2E de acessibilidade automatizada (axe) nem de fluxo de login.
+8. **Idempotência e circuit breaker** do `ExecutionEngine` continuam em memória (portas injetáveis, sem adaptador Postgres).
+9. **Proteção da branch `main`**: apenas documentada; nenhuma regra foi alterada no GitHub.
+10. **Vulnerabilidade moderada** remanescente: `esbuild` via `drizzle-kit` (somente desenvolvimento). Nenhuma alta/crítica.
+
+Estas lacunas devem ser tratadas antes de qualquer conexão com contas reais.

@@ -22,7 +22,7 @@ import type {
   MemberRecordViewModel,
   OrganizationOption,
 } from "@/application/use-cases/dashboard-overview-use-case";
-import { toPublicSafeErrorMessage } from "@/security/vault-and-guards";
+import { toPublicSafeErrorMessage } from "@/security/public-errors";
 import { formatCurrencyBrl } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
