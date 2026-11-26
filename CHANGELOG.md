@@ -5,6 +5,25 @@ Todas as mudanças notáveis neste projeto serão documentadas neste arquivo.
 O formato é baseado em [Keep a Changelog](https://keepachangelog.com/pt-BR/1.1.0/),
 e este projeto adere ao [Versionamento Semântico](https://semver.org/lang/pt-BR/).
 
+## [0.2.0] - 2026-11-26 — Stage 2.0: Authentication, Multi-Tenancy & Google Ads Read-Only
+
+### Adicionado
+- **Fase 1 (Hardening Remanescente)**:
+  - Remoção completa de aprovação por boolean no `ExecutionEngine`; `ApprovalRecord` agora é vinculado ao hash SHA-256 canônico do payload (`actionPayloadHash`).
+  - Chaves estrangeiras compostas `(organization_id, id)` adicionadas a todos os relacionamentos opcionais (`search_terms`, `budgets`, `automation_runs`) na migration `0002_stage2_auth_rls_and_sync.sql`.
+  - Privilégios PostgreSQL da role `konnexy_app` restritos por tabela (tabelas append-only sem `UPDATE`/`DELETE`, tabelas operacionais sem `DELETE`).
+  - Proteção SSRF com porta 443 estrita e IP fixado (`pinnedAddress`) + sanitização de erros públicos (`toPublicSafeErrorMessage`).
+- **Fase 2 & 3 (Auth.js v5, Sessão Server-Side & Repositórios Drizzle Persistentes)**:
+  - Configuração do Auth.js v5 (`/api/auth/[...nextauth]`), `AuthAbuseRateLimiter`, hash `scrypt` e `resolveAuthoritativeTenantContext` (que ignora `role` ou `userId` enviados pelo navegador).
+  - Fluxo de onboarding `onboardFirstOrganizationRepository` criando usuário, organização em `READ_ONLY` e membership `OWNER`.
+  - `PersistentDrizzleTenantRepository` e tabela `member_client_access` com filtragem estrita para `CLIENT_VIEWER`.
+- **Fase 4 & 7 (Central Multi-Tenant & Dashboard Operacional com Logo Oficial)**:
+  - Componente `TenantManagementHub` para gestão de Clientes (com Zod), Contas MCC, Integrações OAuth, Membros RBAC e Configurações/Auditoria.
+  - Barra de seletores operacionais (Organização, Cliente, Conta de Anúncios e Janela Temporal 3d/7d/14d/30d), indicadores completos (Investimento, Conversões, CPA, CPC, CTR, ROAS), diferenciação entre zero, `Sem dados` e `N/D`, e aplicação da Logo Oficial Konnexy Ads (`/konnexy-logo.jpg`).
+- **Fase 5 & 6 (Google Ads API Read-Only, Vault AAD, MCC & Sincronização Incremental)**:
+  - `GoogleAdsReadOnlyIntegrationService` com OAuth 2.0 PKCE (`S256`) + `state` HMAC-SHA256, Credential Vault AES-256-GCM com AAD obrigatório, suporte a MCC (`login-customer-id`), seleção de contas, revogação imediata e executor GAQL somente leitura com paginação e retry.
+  - `IncrementalAdsSyncEngine` sincronizando os 9 domínios com controle de concorrência (`SKIPPED_CONCURRENT_LOCK`), checkpoints e precisão monetária (`cost_micros` → centavos).
+
 ## [0.1.1] - 2026-11-26 — Foundation 1.1: Security Hardening
 
 ### Segurança (Fase A & Fase C)

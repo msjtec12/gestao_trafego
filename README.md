@@ -60,6 +60,7 @@ Documentação detalhada disponível em [`docs/`](./docs/):
 - [Motor de Automações (`docs/automation-engine.md`)](./docs/automation-engine.md)
 - [Roadmap (`docs/roadmap.md`)](./docs/roadmap.md)
 - [Relatório de Hardening Foundation 1.1 (`docs/reviews/foundation-1.1-hardening-report.md`)](./docs/reviews/foundation-1.1-hardening-report.md)
+- [Relatório Etapa 2.0 — Auth, Multi-Tenancy & Google Ads Read-Only (`docs/reviews/stage-2-auth-multitenancy-google-ads-report.md`)](./docs/reviews/stage-2-auth-multitenancy-google-ads-report.md)
 - [ADRs (`docs/adr/`)](./docs/adr/)
 
 ---

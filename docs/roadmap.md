@@ -11,11 +11,14 @@
 
 ---
 
-## Fase 2 — Autenticação Real, Persistência Neon em Nuvem & Google Ads Read-Only
-- [ ] Fluxo completo de login, sessão e onboarding de organizações e clientes com Auth.js v5 (`5.0.0-beta.32`) + Neon PostgreSQL.
-- [ ] Persistência em banco vivo para o Kill Switch global/organizacional, `IdempotencyStore` e `CircuitBreakerStore`.
-- [ ] Fluxo OAuth 2.0 real do Google Ads API com armazenamento criptografado no Credential Vault (`AES-256-GCM` + AAD).
-- [ ] Worker de sincronização inicial (somente leitura) via Vercel Cron para Campanhas, Grupos de Anúncios, Palavras-chave, Termos de Pesquisa e Métricas Diárias.
+## Fase 2 — Autenticação Real, Multi-Tenancy Persistente & Google Ads Read-Only (Concluída)
+- [x] Correções remanescentes da Fase 1: aprovação vinculada ao hash SHA-256 do payload (`actionPayloadHash`), FKs compostas nos relacionamentos opcionais, privilégios PostgreSQL restritos por tabela e sanitização de erros públicos.
+- [x] Autenticação com Auth.js v5 (`5.0.0-beta.32`), rate limiting contra abuso, validação autoritativa de sessão/role no servidor e onboarding seguro da primeira organização em `READ_ONLY`.
+- [x] Repositórios Drizzle persistentes (`PersistentDrizzleTenantRepository`) e tabela `member_client_access` garantindo isolamento para `CLIENT_VIEWER`.
+- [x] Central Multi-Tenant responsiva para gestão de Organizações, Membros, Clientes, Contas MCC, Integrações e Configurações.
+- [x] `GoogleAdsReadOnlyIntegrationService` (OAuth 2.0 PKCE + HMAC state, Credential Vault AES-256-GCM com AAD obrigatório, suporte a MCC, seleção de contas, revogação e GAQL estritamente `SELECT`).
+- [x] `IncrementalAdsSyncEngine` para os 9 domínios com lock de concorrência, checkpoints e conversão exata de `cost_micros`.
+- [x] Dashboard Operacional com seletores de Organização, Cliente, Conta e Período, diferenciação entre zero/`Sem dados`/`N/D` e Logo Oficial Konnexy Ads.
 
 ---
 

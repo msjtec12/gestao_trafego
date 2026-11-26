@@ -13,8 +13,6 @@ import {
   Plus,
   RefreshCw,
   Ban,
-  CheckCircle2,
-  AlertTriangle,
   Lock,
 } from "lucide-react";
 import type {

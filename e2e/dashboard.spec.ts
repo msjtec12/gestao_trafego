@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
-test.describe("Konnexy Ads Foundation 1.1 Hardened Dashboard", () => {
-  test("displays demo identification banner, read-only badge, and simulated emergency kill switch", async ({
+test.describe("Konnexy Ads Stage 2.0 Operational & Multi-Tenant Dashboard", () => {
+  test("displays demo identification banner, official brand logo, operational selectors, and simulated emergency kill switch", async ({
     page,
   }) => {
     await page.goto("/");
@@ -14,6 +14,26 @@ test.describe("Konnexy Ads Foundation 1.1 Hardened Dashboard", () => {
     await expect(
       page.getByTestId("emergency-kill-switch-btn")
     ).toBeVisible();
+
+    // Verify Stage 2 Operational Selectors (Organization, Client, Account, Period)
+    await expect(page.getByTestId("org-selector")).toBeVisible();
+    await expect(page.getByTestId("client-selector")).toBeVisible();
+    await expect(page.getByTestId("account-selector")).toBeVisible();
+    await expect(page.getByTestId("period-selector")).toBeVisible();
+
+    // Switch to Operational Tenant without simulated data and verify explicit "Sem dados" differentiation
+    await page
+      .getByTestId("org-selector")
+      .selectOption("org-prod-konnexy-local");
+    await expect(
+      page.getByTestId("environment-scope-badge")
+    ).toContainText(/AMBIENTE OPERACIONAL \(SEM DADOS SIMULADOS\)/i);
+    await expect(page.getByText("Sem dados").first()).toBeVisible();
+
+    // Switch back to Demo Tenant
+    await page
+      .getByTestId("org-selector")
+      .selectOption("org-demo-konnexy-01");
 
     // Activate simulated Kill Switch and verify alert banner
     await page.getByTestId("emergency-kill-switch-btn").click();
