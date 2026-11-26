@@ -174,7 +174,6 @@ async function ensureBootstrapOwnerOrganization(
         bootstrapNote:
           "Single one-time bootstrap executed because users table was empty.",
       },
-      isDemoData: false,
     });
   });
 }
