@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
 import {
-  withAdminPostgresConnection,
+  withAdminPostgresTransaction,
   withTenantTransaction,
 } from "@/infrastructure/db";
 import * as schema from "@/infrastructure/db/schema";
@@ -26,6 +26,10 @@ import {
 } from "@/security/auth";
 import { requireCredentialsEncryptionKey } from "@/security/env";
 import { toPublicSafeErrorMessage } from "@/security/public-errors";
+import {
+  createRequestCorrelationId,
+  logStructuredServerFailure,
+} from "@/security/structured-logger";
 
 const LoginInputSchema = z.object({
   email: z.string().email("Informe um e-mail válido."),
@@ -60,20 +64,32 @@ const ClientUpdateSchema = ClientCreateSchema.extend({
 export async function loginUserAction(rawInput: {
   readonly email: string;
   readonly password: string;
-}): Promise<{ readonly ok: boolean; readonly error?: string }> {
+}): Promise<{
+  readonly ok: boolean;
+  readonly error?: string;
+  readonly errorCode?: string;
+  readonly requestId?: string;
+}> {
+  const requestId = createRequestCorrelationId();
+  let currentStep = "validate_login_input";
+
   try {
     const parsed = LoginInputSchema.safeParse(rawInput);
     if (!parsed.success) {
       return {
         ok: false,
         error: parsed.error.issues[0]?.message ?? "Credenciais inválidas.",
+        errorCode: "VALIDATION_ERROR",
+        requestId,
       };
     }
 
-    const session = await withAdminPostgresConnection(async (db) => {
-      return await authenticateUserWithPostgres(db, parsed.data);
+    currentStep = "authenticate_user_postgres";
+    const session = await withAdminPostgresTransaction(async (tx) => {
+      return await authenticateUserWithPostgres(tx, parsed.data);
     });
 
+    currentStep = "issue_authjs_session_cookie";
     await issueUnifiedAuthJsSessionCookie({
       userId: session.user.id,
       email: session.user.email,
@@ -82,13 +98,22 @@ export async function loginUserAction(rawInput: {
       activeOrganizationId: session.context.organizationId,
     });
 
+    currentStep = "revalidate_dashboard";
     revalidatePath("/");
     return { ok: true };
   } catch (err) {
+    const meta = logStructuredServerFailure({
+      requestId,
+      flow: "login",
+      step: currentStep,
+      operation: "loginUserAction",
+      error: err,
+    });
     return {
       ok: false,
-      error: toPublicSafeErrorMessage(err, "E-mail ou senha inválidos.")
-        .publicMessage,
+      error: meta.publicMessage,
+      errorCode: meta.errorCode,
+      requestId,
     };
   }
 }
@@ -99,16 +124,33 @@ export async function onboardOrganizationAction(rawInput: {
   readonly password: string;
   readonly organizationName: string;
   readonly organizationSlug: string;
-}): Promise<{ readonly ok: boolean; readonly error?: string }> {
-  try {
-    const result = await withAdminPostgresConnection(async (db) => {
-      const onboarded = await onboardFirstOrganizationRepository(db, {
-        ...rawInput,
-        timezone: "America/Sao_Paulo",
-        currencyCode: "BRL",
-      });
+}): Promise<{
+  readonly ok: boolean;
+  readonly error?: string;
+  readonly errorCode?: string;
+  readonly requestId?: string;
+}> {
+  const requestId = createRequestCorrelationId();
+  let currentStep = "start_onboarding_transaction";
 
-      await db.insert(schema.integrations).values({
+  try {
+    const result = await withAdminPostgresTransaction(async (tx) => {
+      const onboarded = await onboardFirstOrganizationRepository(
+        tx,
+        {
+          ...rawInput,
+          timezone: "America/Sao_Paulo",
+          currencyCode: "BRL",
+        },
+        {
+          onStep: (step) => {
+            currentStep = step;
+          },
+        }
+      );
+
+      currentStep = "insert_default_integration";
+      await tx.insert(schema.integrations).values({
         organizationId: onboarded.organization.id,
         provider: "GOOGLE_ADS",
         externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
@@ -119,6 +161,7 @@ export async function onboardOrganizationAction(rawInput: {
       return onboarded;
     });
 
+    currentStep = "issue_authjs_session_cookie";
     await issueUnifiedAuthJsSessionCookie({
       userId: result.user.id,
       email: result.user.email,
@@ -127,15 +170,22 @@ export async function onboardOrganizationAction(rawInput: {
       activeOrganizationId: result.organization.id,
     });
 
+    currentStep = "revalidate_dashboard";
     revalidatePath("/");
     return { ok: true };
   } catch (err) {
+    const meta = logStructuredServerFailure({
+      requestId,
+      flow: "onboarding",
+      step: currentStep,
+      operation: "onboardOrganizationAction",
+      error: err,
+    });
     return {
       ok: false,
-      error: toPublicSafeErrorMessage(
-        err,
-        "Não foi possível concluir o onboarding."
-      ).publicMessage,
+      error: meta.publicMessage,
+      errorCode: meta.errorCode,
+      requestId,
     };
   }
 }
@@ -148,16 +198,26 @@ export async function logoutUserAction(): Promise<{ readonly ok: boolean }> {
 
 export async function switchOrganizationAction(
   targetOrganizationId: string
-): Promise<{ readonly ok: boolean; readonly error?: string }> {
+): Promise<{
+  readonly ok: boolean;
+  readonly error?: string;
+  readonly errorCode?: string;
+  readonly requestId?: string;
+}> {
+  const requestId = createRequestCorrelationId();
+  let currentStep = "resolve_current_session";
+
   try {
     const currentSession = await resolveUnifiedAuthJsPostgresSession();
-    const updated = await withAdminPostgresConnection(async (db) => {
-      return await switchActiveOrganizationInPostgres(db, {
+    currentStep = "switch_active_organization_postgres";
+    const updated = await withAdminPostgresTransaction(async (tx) => {
+      return await switchActiveOrganizationInPostgres(tx, {
         sessionToken: currentSession.sessionToken,
         targetOrganizationId,
       });
     });
 
+    currentStep = "issue_authjs_session_cookie";
     await issueUnifiedAuthJsSessionCookie({
       userId: updated.user.id,
       email: updated.user.email,
@@ -166,12 +226,22 @@ export async function switchOrganizationAction(
       activeOrganizationId: updated.context.organizationId,
     });
 
+    currentStep = "revalidate_dashboard";
     revalidatePath("/");
     return { ok: true };
   } catch (err) {
+    const meta = logStructuredServerFailure({
+      requestId,
+      flow: "switch_organization",
+      step: currentStep,
+      operation: "switchOrganizationAction",
+      error: err,
+    });
     return {
       ok: false,
-      error: toPublicSafeErrorMessage(err).publicMessage,
+      error: meta.publicMessage,
+      errorCode: meta.errorCode,
+      requestId,
     };
   }
 }

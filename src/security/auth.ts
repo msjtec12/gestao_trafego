@@ -3,7 +3,7 @@ import Credentials from "next-auth/providers/credentials";
 import { encode, decode } from "next-auth/jwt";
 import { cookies } from "next/headers";
 import { z } from "zod";
-import { withAdminPostgresConnection } from "@/infrastructure/db";
+import { withAdminPostgresTransaction } from "@/infrastructure/db";
 import {
   authenticateUserWithPostgres,
   resolveSessionFromPostgres,
@@ -12,12 +12,42 @@ import {
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
 import { requireAuthSecret } from "@/security/env";
 import { UnauthenticatedAccessError } from "@/security/session-guard";
+import {
+  AUTHJS_SESSION_COOKIE_NAME,
+  resolveActiveAuthCookieConfig,
+  SECURE_AUTHJS_SESSION_COOKIE_NAME,
+  SESSION_COOKIE_NAME,
+} from "@/security/auth-cookie-config";
 
-/**
- * Official Auth.js v5 session cookie name.
- */
-export const AUTHJS_SESSION_COOKIE_NAME = "authjs.session-token";
-export const SESSION_COOKIE_NAME = AUTHJS_SESSION_COOKIE_NAME;
+export {
+  AUTHJS_SESSION_COOKIE_NAME,
+  resolveActiveAuthCookieConfig,
+  SECURE_AUTHJS_SESSION_COOKIE_NAME,
+  SESSION_COOKIE_NAME,
+};
+
+async function decodeAuthJsJwtWithMatchingSalt(params: {
+  readonly token: string;
+  readonly secret: string;
+  readonly preferredSalt?: string;
+}): Promise<Record<string, unknown> | null> {
+  const saltsToTry =
+    params.preferredSalt === SECURE_AUTHJS_SESSION_COOKIE_NAME
+      ? [SECURE_AUTHJS_SESSION_COOKIE_NAME, AUTHJS_SESSION_COOKIE_NAME]
+      : [AUTHJS_SESSION_COOKIE_NAME, SECURE_AUTHJS_SESSION_COOKIE_NAME];
+
+  for (const salt of saltsToTry) {
+    const decoded = await decode({
+      token: params.token,
+      secret: params.secret,
+      salt,
+    }).catch(() => null);
+    if (decoded) {
+      return decoded as Record<string, unknown>;
+    }
+  }
+  return null;
+}
 
 const CredentialsInputSchema = z.object({
   email: z.string().email(),
@@ -46,8 +76,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           return null;
         }
 
-        const authenticated = await withAdminPostgresConnection(async (db) => {
-          return await authenticateUserWithPostgres(db, {
+        const authenticated = await withAdminPostgresTransaction(async (tx) => {
+          return await authenticateUserWithPostgres(tx, {
             email: parsed.data.email,
             password: parsed.data.password,
           });
@@ -97,8 +127,8 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
 });
 
 /**
- * Issues an encrypted Auth.js v5 JWT cookie (`authjs.session-token`) bound to a
- * persistent PostgreSQL `user_sessions.session_token`.
+ * Issues an encrypted Auth.js v5 JWT cookie (`__Secure-authjs.session-token` in HTTPS production,
+ * `authjs.session-token` on HTTP localhost) bound to a persistent PostgreSQL `user_sessions.session_token`.
  * Used by both login and onboarding so there is only ONE unified Auth.js session mechanism.
  */
 export async function issueUnifiedAuthJsSessionCookie(params: {
@@ -110,10 +140,11 @@ export async function issueUnifiedAuthJsSessionCookie(params: {
 }): Promise<string> {
   const secret = requireAuthSecret();
   const maxAge = 8 * 60 * 60;
+  const { cookieName, secure } = resolveActiveAuthCookieConfig();
 
   const encodedJwt = await encode({
     secret,
-    salt: AUTHJS_SESSION_COOKIE_NAME,
+    salt: cookieName,
     maxAge,
     token: {
       sub: params.userId,
@@ -125,8 +156,9 @@ export async function issueUnifiedAuthJsSessionCookie(params: {
   });
 
   const cookieStore = await cookies();
-  cookieStore.set(AUTHJS_SESSION_COOKIE_NAME, encodedJwt, {
+  cookieStore.set(cookieName, encodedJwt, {
     httpOnly: true,
+    secure,
     sameSite: "lax",
     path: "/",
     maxAge,
@@ -138,19 +170,31 @@ export async function issueUnifiedAuthJsSessionCookie(params: {
 /**
  * Extracts and verifies the Auth.js v5 JWT from cookies (or a direct `ksess_` token in unit tests)
  * and resolves the authoritative PostgreSQL session from `user_sessions` (enforcing immediate
- * server-side revocation and expiration).
+ * server-side revocation and expiration) inside an atomic administrative transaction.
  */
 export async function resolveUnifiedAuthJsPostgresSession(options?: {
   readonly rawCookieOrToken?: string | null;
   readonly requestedOrganizationId?: string;
 }): Promise<AuthenticatedPostgresSession> {
   let rawValue = options?.rawCookieOrToken?.trim();
+  let preferredSalt: string = resolveActiveAuthCookieConfig().cookieName;
 
   if (!rawValue) {
     const cookieStore = await cookies();
-    rawValue =
-      cookieStore.get(AUTHJS_SESSION_COOKIE_NAME)?.value?.trim() ??
-      cookieStore.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value?.trim();
+    const secureCookieVal = cookieStore
+      .get(SECURE_AUTHJS_SESSION_COOKIE_NAME)
+      ?.value?.trim();
+    const standardCookieVal = cookieStore
+      .get(AUTHJS_SESSION_COOKIE_NAME)
+      ?.value?.trim();
+
+    if (secureCookieVal) {
+      rawValue = secureCookieVal;
+      preferredSalt = SECURE_AUTHJS_SESSION_COOKIE_NAME;
+    } else if (standardCookieVal) {
+      rawValue = standardCookieVal;
+      preferredSalt = AUTHJS_SESSION_COOKIE_NAME;
+    }
   }
 
   if (!rawValue) {
@@ -161,11 +205,11 @@ export async function resolveUnifiedAuthJsPostgresSession(options?: {
 
   if (!rawValue.startsWith("ksess_")) {
     const secret = requireAuthSecret();
-    const decoded = await decode({
+    const decoded = await decodeAuthJsJwtWithMatchingSalt({
       token: rawValue,
       secret,
-      salt: AUTHJS_SESSION_COOKIE_NAME,
-    }).catch(() => null);
+      preferredSalt,
+    });
 
     if (!decoded || typeof decoded.dbSessionToken !== "string") {
       throw new UnauthenticatedAccessError(
@@ -175,8 +219,8 @@ export async function resolveUnifiedAuthJsPostgresSession(options?: {
     dbSessionToken = decoded.dbSessionToken;
   }
 
-  return await withAdminPostgresConnection(async (db) => {
-    return await resolveSessionFromPostgres(db, {
+  return await withAdminPostgresTransaction(async (tx) => {
+    return await resolveSessionFromPostgres(tx, {
       sessionToken: dbSessionToken,
       requestedOrganizationId: options?.requestedOrganizationId,
     });
@@ -185,23 +229,31 @@ export async function resolveUnifiedAuthJsPostgresSession(options?: {
 
 /**
  * Revokes the current Auth.js v5 session in PostgreSQL (`user_sessions.revoked_at = now()`)
- * and deletes the Auth.js session cookie.
+ * and deletes both standard and `__Secure-` Auth.js session cookies.
  */
 export async function revokeUnifiedAuthJsSession(): Promise<void> {
   const cookieStore = await cookies();
-  const rawCookie =
-    cookieStore.get(AUTHJS_SESSION_COOKIE_NAME)?.value?.trim() ??
-    cookieStore.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value?.trim();
+  const secureCookieVal = cookieStore
+    .get(SECURE_AUTHJS_SESSION_COOKIE_NAME)
+    ?.value?.trim();
+  const standardCookieVal = cookieStore
+    .get(AUTHJS_SESSION_COOKIE_NAME)
+    ?.value?.trim();
+
+  const rawCookie = secureCookieVal ?? standardCookieVal;
+  const preferredSalt = secureCookieVal
+    ? SECURE_AUTHJS_SESSION_COOKIE_NAME
+    : AUTHJS_SESSION_COOKIE_NAME;
 
   if (rawCookie) {
     let dbSessionToken = rawCookie;
     if (!rawCookie.startsWith("ksess_")) {
       try {
         const secret = requireAuthSecret();
-        const decoded = await decode({
+        const decoded = await decodeAuthJsJwtWithMatchingSalt({
           token: rawCookie,
           secret,
-          salt: AUTHJS_SESSION_COOKIE_NAME,
+          preferredSalt,
         });
         if (decoded && typeof decoded.dbSessionToken === "string") {
           dbSessionToken = decoded.dbSessionToken;
@@ -212,11 +264,12 @@ export async function revokeUnifiedAuthJsSession(): Promise<void> {
     }
 
     if (dbSessionToken.startsWith("ksess_")) {
-      await withAdminPostgresConnection(async (db) => {
-        await revokeSessionInPostgres(db, dbSessionToken);
+      await withAdminPostgresTransaction(async (tx) => {
+        await revokeSessionInPostgres(tx, dbSessionToken);
       });
     }
   }
 
   cookieStore.delete(AUTHJS_SESSION_COOKIE_NAME);
+  cookieStore.delete(SECURE_AUTHJS_SESSION_COOKIE_NAME);
 }
