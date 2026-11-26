@@ -8,6 +8,13 @@
       "when": 1795693881145,
       "tag": "0000_confused_galactus",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1795695999416,
+      "tag": "0001_multi_tenant_rls_hardening",
+      "breakpoints": true
     }
   ]
 }

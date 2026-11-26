@@ -29,6 +29,18 @@ export type ApprovalStatus =
   | "EXPIRED"
   | "EXECUTED";
 
+export type RecommendationLifecycleState =
+  | "DRAFT"
+  | "VALIDATED"
+  | "PENDING_APPROVAL"
+  | "APPROVED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "EXECUTING"
+  | "VERIFYING"
+  | "EXECUTED_VERIFIED"
+  | "FAILED";
+
 export type AutomationStage =
   | "COLLECTION"
   | "NORMALIZATION"
@@ -47,4 +59,8 @@ export interface TenantContext {
   readonly role: UserRole;
   readonly executionMode: ExecutionMode;
   readonly emergencyStopActive: boolean;
+  /**
+   * Optional list of client IDs this user is restricted to (mandatory for CLIENT_VIEWER).
+   */
+  readonly allowedClientIds?: readonly string[];
 }
