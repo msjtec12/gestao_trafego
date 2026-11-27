@@ -15,7 +15,6 @@ import {
   switchActiveOrganizationInPostgres,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
 import { PersistentPostgresGoogleAdsService } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
-import { PersistentPostgresAdsSyncEngine } from "@/workflows/incremental-sync-engine";
 import {
   PersistentAIRecommendationsAndReportsRepository,
   type PersistedExecutiveReport,
@@ -467,144 +466,40 @@ export async function requestSyncServerAction(
   integrationId: string
 ): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
-    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
     const session = await resolveUnifiedAuthJsPostgresSession();
-
     return await withTenantTransaction(session.context, async (tx) => {
       const repo = new PersistentDrizzleTenantRepository(tx);
       const integrations = await repo.listPublicIntegrations(session.context);
-      const targetIntegration = integrations.find((i) => i.id === integrationId);
-
-      if (!targetIntegration) {
-        return {
-          ok: false,
-          error: "Integração não encontrada na organização ativa.",
-        };
+      if (!integrations.some((integration) => integration.id === integrationId)) {
+        return { ok: false, error: "Integração não encontrada na organização ativa." };
       }
-
-      if (targetIntegration.status === "REVOKED") {
-        return {
-          ok: false,
-          error:
-            "Esta integração foi revogada. Reconecte via OAuth antes de sincronizar.",
-        };
-      }
-
-      if (targetIntegration.provider === "GOOGLE_ADS") {
-        const googleService = new PersistentPostgresGoogleAdsService(
-          tx,
-          keyHex,
-          keyVersion
-        );
-        // Strictly verifies real OAuth credentials in Vault (never fakes a live Google Ads sync)
-        await googleService.resolveDecryptedTokenFromPostgres({
-          context: session.context,
-          integrationId,
-        });
-      }
-
-      const clients = await repo.listClients(session.context);
-      const primaryClient = clients[0];
-      if (!primaryClient) {
-        return {
-          ok: false,
-          error:
-            "Cadastre pelo menos um cliente ativo antes de executar a sincronização.",
-        };
-      }
-
-      const syncEngine = new PersistentPostgresAdsSyncEngine(tx);
-      await syncEngine.executePersistentSync({
-        context: session.context,
-        integrationId: targetIntegration.id,
-        clientId: primaryClient.id,
-        provider: targetIntegration.provider,
-        fetchBatchFn: async (prevCkpt) => ({
-          checkpointToken: `ckpt-pg-${Date.now()}`,
-          currencyCode: "BRL",
-          timezone: "America/Sao_Paulo",
-          isDemoData: targetIntegration.isDemoIntegration,
-          adAccounts: [
-            {
-              externalAccountId: "4028819001",
-              name: `Conta ${primaryClient.name}`,
-              managerCustomerId: "9901002000",
-            },
-          ],
-          campaigns: [
-            {
-              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-              name: `Search — ${primaryClient.name}`,
-              dailyBudgetMicros: 200_000_000,
-            },
-          ],
-          adGroups: [
-            {
-              externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
-              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-              name: "Grupo Principal Search",
-            },
-          ],
-          ads: [
-            {
-              externalAdId: `AD-${primaryClient.id.slice(0, 6)}`,
-              externalAdGroupId: `AG-${primaryClient.id.slice(0, 6)}`,
-              finalUrl: "https://ads.konnexy.com.br",
-            },
-          ],
-          keywords: [
-            {
-              externalKeywordId: `KW-${primaryClient.id.slice(0, 6)}`,
-              text: primaryClient.industry.toLowerCase(),
-              matchType: "EXACT",
-            },
-          ],
-          searchTerms: [
-            {
-              searchTerm: `${primaryClient.industry.toLowerCase()} especialista`,
-              costMicros: 45_000_000,
-              observedDate: "2026-11-26",
-            },
-          ],
-          conversions: [
-            {
-              externalConversionId: `CONV-${primaryClient.id.slice(0, 6)}`,
-              name: "Lead Qualificado",
-            },
-          ],
-          dailyMetrics: [
-            {
-              externalCampaignId: `CAMP-${primaryClient.id.slice(0, 6)}`,
-              metricDate: "2026-11-26",
-              impressions: 1500,
-              clicks: 90,
-              costMicros: prevCkpt ? 195_000_000 : 180_000_000,
-              conversions: 6,
-              conversionValueMicros: 1_080_000_000,
-            },
-          ],
-          budgets: [
-            {
-              periodMonth: "2026-11",
-              allocatedMicros: primaryClient.monthlyBudgetCapCents * 10_000,
-              spentMicros: 180_000_000,
-            },
-          ],
-        }),
-      });
-
-      revalidatePath("/");
-      return { ok: true };
+      // Fail closed until a validated, account-scoped GAQL adapter is wired into this action.
+      // OAuth token availability alone does not establish metric provenance.
+      return {
+        ok: false,
+        error: "Sincronização temporariamente bloqueada: a importação de métricas reais ainda precisa ser validada. Nenhum dado demonstrativo será gravado.",
+      };
     });
   } catch (err) {
     return {
       ok: false,
-      error: toPublicSafeErrorMessage(
-        err,
-        "Sincronização bloqueada: credenciais OAuth reais do Google Ads não conectadas."
-      ).publicMessage,
+      error: toPublicSafeErrorMessage(err).publicMessage,
     };
   }
+}
+
+async function hasUnverifiedCampaignData(
+  tx: import("@/infrastructure/db").DrizzleQueryExecutor,
+  organizationId: string
+): Promise<boolean> {
+  const rows = await tx.select({ id: schema.campaigns.id })
+    .from(schema.campaigns)
+    .where(sql`${schema.campaigns.organizationId} = ${organizationId}
+      AND (${schema.campaigns.isDemoData} = true OR
+      (${schema.campaigns.provider} = 'GOOGLE_ADS' AND
+      ${schema.campaigns.externalCampaignId} !~ '^[0-9]+$'))`)
+    .limit(1);
+  return rows.length > 0;
 }
 
 const ReviewRecommendationInputSchema = z.object({
@@ -631,6 +526,9 @@ export async function runSupervisedAIAnalysisServerAction(rawInput?: {
   try {
     const session = await resolveUnifiedAuthJsPostgresSession();
     const result = await withTenantTransaction(session.context, async (tx) => {
+      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
+        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
+      }
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.runSupervisedAIAnalysisAndPersist(session.context, {
         clientId: rawInput?.clientId,
@@ -678,6 +576,9 @@ export async function reviewRecommendationServerAction(rawInput: {
 
     const session = await resolveUnifiedAuthJsPostgresSession();
     const result = await withTenantTransaction(session.context, async (tx) => {
+      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
+        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
+      }
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.reviewRecommendationWithPayloadBoundApproval(
         session.context,
@@ -725,6 +626,9 @@ export async function generateExecutiveReportServerAction(rawInput: {
 
     const session = await resolveUnifiedAuthJsPostgresSession();
     const report = await withTenantTransaction(session.context, async (tx) => {
+      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
+        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
+      }
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.generateAndPersistExecutiveReport(
         session.context,
