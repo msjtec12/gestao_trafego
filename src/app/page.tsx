@@ -1,50 +1,54 @@
-import { cookies } from "next/headers";
-import { redirect } from "next/navigation";
-import { getAuthenticatedOperationalDashboardUseCase } from "@/application/use-cases/dashboard-overview-use-case";
-import { DashboardShell } from "@/components/dashboard/dashboard-shell";
-import { AUTHJS_SESSION_COOKIE_NAME } from "@/middleware";
+import { requireOperationalWorkspace } from "@/application/use-cases/operational-workspace-loader";
+import { CommercialAppShell } from "@/components/workspace/commercial-app-shell";
+import { OverviewDashboardClient } from "@/components/workspace/overview-dashboard-client";
 
 export const dynamic = "force-dynamic";
 
-export default async function HomePage() {
-  const cookieStore = await cookies();
-  const sessionToken =
-    cookieStore.get(AUTHJS_SESSION_COOKIE_NAME)?.value ??
-    cookieStore.get(`__Secure-${AUTHJS_SESSION_COOKIE_NAME}`)?.value;
+export default async function HomePage({
+  searchParams,
+}: {
+  readonly searchParams: Promise<{
+    clientId?: string;
+    adAccountId?: string;
+    campaignId?: string;
+    periodDays?: string;
+  }>;
+}) {
+  const sp = await searchParams;
+  const periodDays = Number(sp.periodDays) || 30;
 
-  if (!sessionToken) {
-    redirect("/login");
-  }
-
-  let vm;
-  try {
-    vm = await getAuthenticatedOperationalDashboardUseCase({
-      sessionToken,
-    });
-  } catch {
-    redirect("/login");
-  }
+  const ws = await requireOperationalWorkspace({
+    clientId: sp.clientId || undefined,
+    adAccountId: sp.adAccountId || undefined,
+    campaignId: sp.campaignId || undefined,
+    periodDays,
+  });
 
   return (
-    <DashboardShell
-      organizationName={vm.organizationName}
-      organizationId={vm.organizationId}
-      authenticatedUserEmail={vm.authenticatedUserEmail}
-      isDemoEnvironment={false}
-      emergencyStopActive={vm.emergencyStopActive}
-      organizations={vm.organizations}
-      clients={vm.clients}
-      adAccounts={vm.adAccounts}
-      members={vm.members}
-      integrations={vm.integrations}
-      syncHistory={vm.syncHistory}
-      auditTrail={vm.auditTrail}
-      campaigns={vm.campaigns}
-      dailyMetrics={vm.dailyMetrics}
-      recommendations={vm.recommendations}
-      persistedRecommendations={vm.persistedRecommendations}
-      executiveReports={vm.executiveReports}
-      domainTables={vm.domainTables}
-    />
+    <CommercialAppShell
+      pageTitle="Visão Geral"
+      pageSubtitle="Acompanhe investimentos, conversões, metas e próximos passos da operação."
+      organizationId={ws.organizationId}
+      organizationName={ws.organizationName}
+      organizations={ws.organizations}
+      authenticatedUserEmail={ws.authenticatedUserEmail}
+      emergencyStopActive={ws.emergencyStopActive}
+    >
+      <OverviewDashboardClient
+        clients={ws.clients}
+        adAccounts={ws.adAccounts}
+        campaigns={ws.campaigns}
+        dailyMetrics={ws.dailyMetrics}
+        kpiSummary={ws.kpiSummary}
+        onboardingChecklist={ws.onboardingChecklist}
+        executiveReports={ws.executiveReports}
+        initialFilters={{
+          clientId: sp.clientId ?? "",
+          adAccountId: sp.adAccountId ?? "",
+          campaignId: sp.campaignId ?? "",
+          periodDays,
+        }}
+      />
+    </CommercialAppShell>
   );
 }

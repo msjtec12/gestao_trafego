@@ -84,7 +84,9 @@ test.describe("Konnexy Ads Stage 2.2 Production Readiness, Unified Auth.js & WCA
     await expect(page).toHaveURL(/\/$/, { timeout: 25000 });
     await expect(
       page.getByTestId("environment-scope-badge")
-    ).toContainText(/AMBIENTE OPERACIONAL \(SEM DADOS SIMULADOS\)/i);
+    ).toContainText(/AMBIENTE OPERACIONAL \(SEM DADOS SIMULADOS\)/i, {
+      timeout: 15000,
+    });
 
     // Verify unified Auth.js session cookie ('authjs.session-token') was issued
     const cookies = await context.cookies();

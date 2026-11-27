@@ -623,6 +623,9 @@ export class PersistentDrizzleTenantRepository {
   public async updateOrganizationSettings(
     context: TenantContext,
     input: {
+      readonly name?: string;
+      readonly timezone?: string;
+      readonly currencyCode?: string;
       readonly maxDailyBudgetChangePct?: number;
       readonly minCooldownMinutes?: number;
       readonly emergencyStopActive?: boolean;
@@ -637,6 +640,9 @@ export class PersistentDrizzleTenantRepository {
     const [updated] = await this.db
       .update(schema.organizations)
       .set({
+        name: input.name?.trim() || current.name,
+        timezone: input.timezone?.trim() || current.timezone,
+        currencyCode: input.currencyCode?.trim().toUpperCase() || current.currencyCode,
         maxDailyBudgetChangePct:
           input.maxDailyBudgetChangePct ?? current.maxDailyBudgetChangePct,
         minCooldownMinutes:
@@ -757,8 +763,10 @@ export class PersistentDrizzleTenantRepository {
       readonly clientId: string;
       readonly name: string;
       readonly industry: string;
+      readonly websiteUrl?: string | null;
       readonly monthlyBudgetCapCents: number;
       readonly targetCpaCents?: number | null;
+      readonly targetRoas?: string | null;
     }
   ): Promise<typeof schema.clients.$inferSelect> {
     const authCtx = assertAuthenticatedDbContext(context);
@@ -788,11 +796,19 @@ export class PersistentDrizzleTenantRepository {
       .set({
         name: input.name.trim(),
         industry: input.industry.trim(),
+        websiteUrl:
+          input.websiteUrl !== undefined
+            ? input.websiteUrl?.trim() || null
+            : existing.websiteUrl,
         monthlyBudgetCapCents: input.monthlyBudgetCapCents,
         targetCpaCents:
           input.targetCpaCents !== undefined
             ? input.targetCpaCents
             : existing.targetCpaCents,
+        targetRoas:
+          input.targetRoas !== undefined
+            ? input.targetRoas
+            : existing.targetRoas,
         updatedAt: new Date(),
       })
       .where(
