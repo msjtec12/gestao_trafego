@@ -32,9 +32,21 @@ import {
 
 export interface CampaignsTableProps {
   readonly campaigns: NormalizedCampaign[];
+  readonly lastVerifiedSyncAtIso?: string | null;
+  readonly isStale?: boolean;
+  readonly isContaminated?: boolean;
+  readonly periodLabel?: string;
 }
 
-export function CampaignsTable({ campaigns }: CampaignsTableProps) {
+export function CampaignsTable({
+  campaigns,
+  lastVerifiedSyncAtIso = null,
+  isStale = false,
+  isContaminated = false,
+  periodLabel = "Últimos 7 dias",
+}: CampaignsTableProps) {
+  const isDemoDataset =
+    campaigns.length > 0 && campaigns.every((c) => c.isDemoData);
   const [sorting, setSorting] = React.useState<SortingState>([
     { id: "spend7dBrl", desc: true },
   ]);
@@ -64,21 +76,27 @@ export function CampaignsTable({ campaigns }: CampaignsTableProps) {
     () => [
       {
         accessorKey: "name",
-        header: "Campanha / Cliente (Demo)",
+        header: "Campanha / Cliente",
         cell: ({ row }) => {
           const item = row.original;
+          const isOfficialNumericId = /^\d+$/.test(item.externalCampaignId);
           return (
             <div className="min-w-[240px]">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-medium text-slate-900 dark:text-slate-100">
                   {item.name}
                 </span>
+                {item.isDemoData ? (
+                  <Badge variant="demo">DEMO</Badge>
+                ) : !isOfficialNumericId ? (
+                  <Badge variant="destructive">NÃO VERIFICADA</Badge>
+                ) : null}
               </div>
               <div className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-2 mt-0.5">
                 <span>{item.clientName}</span>
                 <span>•</span>
                 <code className="text-[11px] text-cyan-600 dark:text-cyan-400">
-                  {item.externalCampaignId}
+                  ID: {item.externalCampaignId}
                 </code>
               </div>
             </div>
@@ -236,14 +254,35 @@ export function CampaignsTable({ campaigns }: CampaignsTableProps) {
       <CardHeader>
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <CardTitle className="text-base">
-                Monitoramento Centralizado de Campanhas (Multi-Client)
+                Monitoramento Centralizado de Campanhas
               </CardTitle>
-              <Badge variant="demo">MOCK PROVIDER • SOMENTE LEITURA</Badge>
+              {isDemoDataset ? (
+                <Badge variant="demo">MOCK PROVIDER • DEMO</Badge>
+              ) : isContaminated ? (
+                <Badge variant="destructive">
+                  INTEGRIDADE COMPROMETIDA (RECONCILIAÇÃO NECESSÁRIA)
+                </Badge>
+              ) : (
+                <Badge variant="success">
+                  GOOGLE ADS API v26 • SOMENTE LEITURA
+                </Badge>
+              )}
+              {isStale && !isDemoDataset && (
+                <Badge variant="warning">DADOS DESATUALIZADOS (&gt;24h)</Badge>
+              )}
             </div>
             <CardDescription className="mt-1">
-              Tabela interativa TanStack Table v8 com filtro composto, ordenação multi-coluna e paginação
+              {isDemoDataset
+                ? "Ambiente demonstrativo isolado (MockAdsProvider) • Dados ilustrativos"
+                : `Fonte oficial: Google Ads API v26 (READ_ONLY) • Período: ${periodLabel}${
+                    lastVerifiedSyncAtIso
+                      ? ` • Última sincronização verificada: ${new Date(
+                          lastVerifiedSyncAtIso
+                        ).toLocaleString("pt-BR")}`
+                      : " • Nenhuma sincronização oficial concluída ainda"
+                  }`}
             </CardDescription>
           </div>
 

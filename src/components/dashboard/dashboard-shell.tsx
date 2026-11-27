@@ -33,6 +33,7 @@ import { DashboardOverview } from "./dashboard-overview";
 import { CommandPalette } from "./command-palette";
 
 import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
+import type { OrganizationDataIntegrityReport } from "@/infrastructure/db/reconciliation/data-integrity-reconciler";
 
 export interface GoogleAdsUiNotice {
   readonly status: "connected" | "error";
@@ -53,6 +54,7 @@ export interface DashboardShellProps {
   readonly integrations?: readonly IntegrationHealthViewModel[];
   readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
   readonly googleAdsNotice?: GoogleAdsUiNotice | null;
+  readonly dataIntegrity?: OrganizationDataIntegrityReport;
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
@@ -101,6 +103,7 @@ export function DashboardShell({
   integrations = [],
   googleAdsConfigStatus,
   googleAdsNotice = null,
+  dataIntegrity,
   syncHistory = [],
   auditTrail = [],
   campaigns,
@@ -254,6 +257,24 @@ export function DashboardShell({
           </div>
         )}
 
+        {!activeOrganization.isDemo && dataIntegrity?.isContaminated && (
+          <div
+            role="alert"
+            data-testid="data-integrity-contamination-banner"
+            className="mx-4 sm:mx-6 mt-4 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3 text-xs text-red-800 dark:text-red-200 space-y-1"
+          >
+            <p className="font-semibold">
+              Alerta de Integridade de Dados: registros sintéticos/não verificados detectados
+            </p>
+            <p>{dataIntegrity.blockingReasons.join(" ")}</p>
+            <p className="text-[11px] opacity-90">
+              Geração de recomendações de IA e relatórios executivos está
+              automaticamente bloqueada até a quarentena e reconciliação com a
+              Google Ads API oficial.
+            </p>
+          </div>
+        )}
+
         <DashboardOverview
           organizationName={activeOrganization.name}
           activeOrganization={activeOrganization}
@@ -264,6 +285,7 @@ export function DashboardShell({
           members={members}
           integrations={integrations}
           googleAdsConfigStatus={googleAdsConfigStatus}
+          dataIntegrity={dataIntegrity}
           syncHistory={syncHistory}
           auditTrail={auditTrail}
           campaigns={campaigns}

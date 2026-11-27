@@ -21,18 +21,26 @@ export interface PerformanceChartProps {
 }
 
 export function PerformanceChart({ metrics }: PerformanceChartProps) {
+  const isDemo = metrics.some((m) => m.isDemoData);
+
   return (
     <Card className="col-span-1 lg:col-span-2">
       <CardHeader className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 pb-4">
         <div>
           <div className="flex items-center gap-2">
             <CardTitle className="text-base">
-              Curva de Eficiência — Investimento vs. Conversões & CPA (7 Dias)
+              Curva de Eficiência — Investimento vs. Conversões & CPA
             </CardTitle>
-            <Badge variant="demo">DADOS DEMO</Badge>
+            {isDemo ? (
+              <Badge variant="demo">DADOS DEMO</Badge>
+            ) : (
+              <Badge variant="success">Google Ads API (Dados Reais)</Badge>
+            )}
           </div>
           <CardDescription className="mt-1">
-            Série temporal consolidada do MockAdsProvider • Valores normalizados em BRL (R$)
+            {isDemo
+              ? "Série temporal consolidada do MockAdsProvider • Valores normalizados em BRL (R$)"
+              : "Série temporal oficial sincronizada da Google Ads API (READ_ONLY) • Valores em BRL (R$)"}
           </CardDescription>
         </div>
       </CardHeader>

@@ -924,6 +924,7 @@ export class PersistentPostgresGoogleAdsService {
     readonly integrationId: string;
     readonly customerId: string;
     readonly gaqlQuery: string;
+    readonly managerCustomerId?: string | null;
     readonly developerToken?: string | null;
     readonly pageSize?: number;
     readonly maxPages?: number;
@@ -935,6 +936,7 @@ export class PersistentPostgresGoogleAdsService {
       integrationId,
       customerId,
       gaqlQuery,
+      managerCustomerId: explicitManagerCustomerId,
       developerToken,
       pageSize = 10_000,
       maxPages = 10,
@@ -955,17 +957,22 @@ export class PersistentPostgresGoogleAdsService {
       );
     }
 
-    const { accessToken, managerCustomerId } =
+    const { accessToken, managerCustomerId: storedManagerCustomerId } =
       await this.resolveDecryptedTokenFromPostgres({
         context,
         integrationId,
       });
 
+    const effectiveManagerCustomerId =
+      explicitManagerCustomerId !== undefined
+        ? explicitManagerCustomerId
+        : storedManagerCustomerId;
+
     const normalizedCustomerId = normalizeGoogleAdsCustomerId(customerId);
     const headers = buildGoogleAdsReadOnlyHeaders({
       accessToken,
       developerToken,
-      managerCustomerId,
+      managerCustomerId: effectiveManagerCustomerId,
     });
 
     const aggregated: T[] = [];
