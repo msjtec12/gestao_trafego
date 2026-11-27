@@ -9,6 +9,26 @@ import {
 } from "@/security/env";
 import { toPublicSafeErrorMessage } from "@/security/public-errors";
 
+function isBrowserHtmlRequest(request: NextRequest): boolean {
+  const accept = request.headers.get("accept") ?? "";
+  return accept.includes("text/html");
+}
+
+function buildFriendlyUiRedirect(
+  request: NextRequest,
+  params: {
+    readonly status: "error";
+    readonly code: string;
+    readonly message: string;
+  }
+): NextResponse {
+  const target = new URL("/", request.url);
+  target.searchParams.set("googleAdsStatus", params.status);
+  target.searchParams.set("googleAdsCode", params.code);
+  target.searchParams.set("googleAdsMessage", params.message);
+  return NextResponse.redirect(target);
+}
+
 export async function GET(request: NextRequest) {
   try {
     const rawCookie =
@@ -21,7 +41,6 @@ export async function GET(request: NextRequest) {
 
     const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
     const oauthConfig = requireGoogleAdsOAuthConfig();
-    const redirectUri = `${oauthConfig.appUrl}/api/integrations/google-ads/callback`;
 
     const authReq = await withTenantTransaction(
       session.context,
@@ -34,7 +53,7 @@ export async function GET(request: NextRequest) {
         return await service.initiatePersistentOAuth({
           context: session.context,
           clientId: oauthConfig.clientId,
-          redirectUri,
+          redirectUri: oauthConfig.redirectUri,
           stateSigningSecret: oauthConfig.stateSigningSecret,
         });
       }
@@ -52,6 +71,14 @@ export async function GET(request: NextRequest) {
         : safe.errorCode === "RBAC_PERMISSION_DENIED"
           ? 403
           : 422;
+
+    if (status !== 401 && isBrowserHtmlRequest(request)) {
+      return buildFriendlyUiRedirect(request, {
+        status: "error",
+        code: safe.errorCode,
+        message: safe.publicMessage,
+      });
+    }
 
     return NextResponse.json(safe, { status });
   }

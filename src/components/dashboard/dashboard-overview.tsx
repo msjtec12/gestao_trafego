@@ -43,6 +43,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
 import { PerformanceChart } from "./performance-chart";
 import { CampaignsTable } from "./campaigns-table";
 import { AIRecommendationsPanel } from "./ai-recommendations-panel";
@@ -58,6 +59,7 @@ export interface DashboardOverviewProps {
   readonly adAccounts: readonly AdAccountRecordViewModel[];
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
+  readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
@@ -124,6 +126,7 @@ export function DashboardOverview({
   adAccounts,
   members,
   integrations,
+  googleAdsConfigStatus,
   syncHistory = [],
   auditTrail = [],
   campaigns,
@@ -611,6 +614,7 @@ export function DashboardOverview({
           adAccounts={adAccounts}
           members={members}
           integrations={integrations}
+          googleAdsConfigStatus={googleAdsConfigStatus}
           syncHistory={syncHistory}
           auditTrail={auditTrail}
         />

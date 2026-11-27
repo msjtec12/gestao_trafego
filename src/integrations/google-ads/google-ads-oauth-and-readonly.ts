@@ -215,6 +215,36 @@ export function normalizeGoogleAdsCustomerId(rawCustomerId: string): string {
   return digits;
 }
 
+/**
+ * Dedicated error raised when Google Ads API rejects a production account request
+ * because the linked Google Cloud project only has Test Access
+ * (`AuthorizationError.CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION`, Google Ads API Sep 9, 2026 policy).
+ */
+export class GoogleAdsCloudProjectApprovalError extends Error {
+  public readonly errorCode = "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION";
+  public readonly statusCode = 403;
+
+  constructor(
+    message = "O projeto Google Cloud vinculado às credenciais OAuth possui apenas Acesso de Teste na Google Ads API. Solicite aprovação de produção no Google Cloud Console (Google Ads API Overview) ou utilize uma conta de teste do Google Ads."
+  ) {
+    super(message);
+    this.name = "GoogleAdsCloudProjectApprovalError";
+  }
+}
+
+export function isCloudProjectNotApprovedForProductionError(
+  responseBody: string
+): boolean {
+  return responseBody.includes("CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION");
+}
+
+/**
+ * Builds official Google Ads API v26 READ_ONLY REST headers.
+ * Per the September 9, 2026 official Google Ads API update, authorization and access level
+ * are linked directly to the Google Cloud project via OAuth 2.0 (`Authorization: Bearer ...`).
+ * `GOOGLE_ADS_DEVELOPER_TOKEN` is NO LONGER required and is omitted unless an explicit
+ * non-placeholder legacy token is supplied.
+ */
 export function buildGoogleAdsReadOnlyHeaders(params: {
   readonly accessToken: string;
   readonly developerToken?: string | null;
@@ -228,16 +258,9 @@ export function buildGoogleAdsReadOnlyHeaders(params: {
   if (
     params.developerToken &&
     params.developerToken.trim() !== "" &&
-    !params.developerToken.startsWith("replace_with_")
+    !params.developerToken.trim().startsWith("replace_with_")
   ) {
     headers["developer-token"] = params.developerToken.trim();
-  } else if (params.developerToken?.startsWith("replace_with_")) {
-    throw new ProviderIntegrationError(
-      "GOOGLE_ADS",
-      "NOT_CONFIGURED_IN_FOUNDATION",
-      false,
-      "GOOGLE_ADS_DEVELOPER_TOKEN contains placeholder value."
-    );
   }
 
   if (params.managerCustomerId) {
@@ -863,6 +886,10 @@ export class PersistentPostgresGoogleAdsService {
       dnsResolver: params.dnsResolver,
     });
 
+    if (isCloudProjectNotApprovedForProductionError(resp.bodyText)) {
+      throw new GoogleAdsCloudProjectApprovalError();
+    }
+
     if (resp.statusCode === 401 || resp.statusCode === 403) {
       throw new ProviderIntegrationError(
         "GOOGLE_ADS",
@@ -968,6 +995,10 @@ export class PersistentPostgresGoogleAdsService {
             customPinnedExecutor,
             dnsResolver,
           });
+
+          if (isCloudProjectNotApprovedForProductionError(resp.bodyText)) {
+            throw new GoogleAdsCloudProjectApprovalError();
+          }
 
           if (resp.statusCode === 429 || resp.statusCode === 503) {
             throw new ProviderIntegrationError(

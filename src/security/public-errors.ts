@@ -71,6 +71,17 @@ export function toPublicSafeErrorMessage(
   const code = errObj.errorCode ?? errObj.code ?? errObj.name ?? "INTERNAL_ERROR";
   const rawMessage = typeof errObj.message === "string" ? errObj.message : "";
 
+  if (
+    String(code) === "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION" ||
+    rawMessage.includes("CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION")
+  ) {
+    return {
+      errorCode: "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION",
+      publicMessage:
+        "O projeto Google Cloud vinculado às credenciais OAuth possui apenas Acesso de Teste na Google Ads API. Solicite aprovação para produção (Explorer, Basic ou Standard) no Google Cloud Console ou conecte uma conta de teste do Google Ads.",
+    };
+  }
+
   const internalLeakPatterns = [
     /postgresql:\/\//i,
     /select\s+.*\s+from\s+/i,

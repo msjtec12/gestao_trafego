@@ -36,6 +36,7 @@ import {
   updateClientServerAction,
 } from "@/app/actions/operational-actions";
 import { formatCurrencyBrl } from "@/lib/utils";
+import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -52,6 +53,7 @@ export interface TenantManagementHubProps {
   readonly adAccounts: readonly AdAccountRecordViewModel[];
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
+  readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
 }
@@ -69,6 +71,7 @@ export function TenantManagementHub({
   adAccounts,
   members,
   integrations,
+  googleAdsConfigStatus,
   syncHistory = [],
   auditTrail = [],
 }: TenantManagementHubProps) {
@@ -639,6 +642,65 @@ export function TenantManagementHub({
         {/* TAB 3: INTEGRATIONS, GOOGLE ADS OAUTH & SYNC HISTORY */}
         {activeTab === "integrations" && (
           <div className="space-y-4">
+            {googleAdsConfigStatus && !activeOrganization.isDemo && (
+              <div
+                data-testid="google-ads-config-status-panel"
+                className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/50 p-4 space-y-2 text-xs"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-semibold text-slate-900 dark:text-slate-100">
+                    Status da Configuração Google Ads (Política Oficial
+                    09/09/2026)
+                  </span>
+                  <Badge
+                    variant={
+                      googleAdsConfigStatus.configured ? "success" : "warning"
+                    }
+                  >
+                    {googleAdsConfigStatus.configured
+                      ? "OAuth Google Cloud Configurado"
+                      : "Configuração Pendente"}
+                  </Badge>
+                </div>
+                <p className="text-slate-600 dark:text-slate-300">
+                  Autorização vinculada ao projeto Google Cloud (OAuth 2.0 +
+                  PKCE em modo <strong>READ_ONLY</strong>).{" "}
+                  <code>GOOGLE_ADS_DEVELOPER_TOKEN</code> não é mais obrigatório.
+                </p>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1 text-[11px]">
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950/60 px-3 py-2">
+                    <span className="text-slate-600 dark:text-slate-300 block">
+                      URL de Callback Oficial
+                    </span>
+                    <code className="text-cyan-700 dark:text-cyan-400 break-all">
+                      {googleAdsConfigStatus.callbackUrl}
+                    </code>
+                    {!googleAdsConfigStatus.callbackUrlValid &&
+                      googleAdsConfigStatus.callbackUrlError && (
+                        <p className="text-red-600 dark:text-red-300 mt-1">
+                          {googleAdsConfigStatus.callbackUrlError}
+                        </p>
+                      )}
+                  </div>
+                  <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950/60 px-3 py-2">
+                    <span className="text-slate-600 dark:text-slate-300 block">
+                      Credenciais Obrigatórias (Google Cloud)
+                    </span>
+                    {googleAdsConfigStatus.missingVariables.length === 0 ? (
+                      <span className="text-emerald-700 dark:text-emerald-300 font-medium">
+                        GOOGLE_ADS_CLIENT_ID e GOOGLE_ADS_CLIENT_SECRET ativos
+                      </span>
+                    ) : (
+                      <span className="text-amber-700 dark:text-amber-300 font-medium">
+                        Pendente:{" "}
+                        {googleAdsConfigStatus.missingVariables.join(", ")}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
             <div className="space-y-3">
               {integrations.map((intg) => (
                 <div
