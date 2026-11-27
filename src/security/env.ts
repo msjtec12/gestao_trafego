@@ -211,53 +211,32 @@ export function validateOfficialGoogleAdsCallbackUrl(
   readonly callbackUrl: string;
   readonly error: string | null;
 } {
-  const trimmedBase = rawAppUrl.trim().replace(/\/+$/, "");
-  const candidate = `${trimmedBase}${OFFICIAL_GOOGLE_ADS_CALLBACK_PATH}`;
-
-  let parsed: URL;
+  const invalid = (error: string) => ({
+    valid: false as const,
+    callbackUrl: "",
+    error,
+  });
+  let base: URL;
   try {
-    parsed = new URL(candidate);
+    base = new URL(rawAppUrl.trim());
   } catch {
-    return {
-      valid: false,
-      callbackUrl: candidate,
-      error:
-        "URL de callback oficial do Google Ads inválida. Verifique NEXT_PUBLIC_APP_URL.",
-    };
+    return invalid("URL de callback inválida. Verifique NEXT_PUBLIC_APP_URL.");
   }
-
   const isProduction =
     rawEnv.NODE_ENV === "production" ||
     rawEnv.VERCEL === "1" ||
     Boolean(rawEnv.VERCEL_ENV);
-  const isLocalhost =
-    parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-
-  if (parsed.pathname !== OFFICIAL_GOOGLE_ADS_CALLBACK_PATH) {
-    return {
-      valid: false,
-      callbackUrl: parsed.toString(),
-      error: `O caminho de callback deve ser exatamente ${OFFICIAL_GOOGLE_ADS_CALLBACK_PATH}.`,
-    };
+  const isLocalhost = ["localhost", "127.0.0.1", "[::1]"].includes(base.hostname);
+  if (base.username || base.password || base.search || base.hash || base.pathname !== "/") {
+    return invalid("NEXT_PUBLIC_APP_URL deve conter apenas a origem, sem credenciais, caminho, query ou fragmento.");
   }
-
-  if (isProduction && parsed.protocol !== "https:") {
-    return {
-      valid: false,
-      callbackUrl: parsed.toString(),
-      error:
-        "Em produção, a URL de callback oficial do Google Ads deve utilizar HTTPS (ex.: https://ads.konnexy.com.br/api/integrations/google-ads/callback).",
-    };
+  if (base.protocol !== "https:" && !(base.protocol === "http:" && isLocalhost && !isProduction)) {
+    return invalid("A URL de callback do Google Ads deve utilizar HTTPS, exceto HTTP local em desenvolvimento.");
   }
-
-  if (!isProduction && !isLocalhost && parsed.protocol !== "https:") {
-    return {
-      valid: false,
-      callbackUrl: parsed.toString(),
-      error:
-        "A URL de callback do Google Ads deve usar HTTPS fora de localhost.",
-    };
+  if (isProduction && isLocalhost) {
+    return invalid("A URL de callback em produção não pode apontar para localhost.");
   }
+  const parsed = new URL(OFFICIAL_GOOGLE_ADS_CALLBACK_PATH, base.origin);
 
   return {
     valid: true,
@@ -271,6 +250,13 @@ export function validateOfficialGoogleAdsCallbackUrl(
  * aligned with the September 9, 2026 Google Ads API policy (Google Cloud Project authorization,
  * no mandatory `GOOGLE_ADS_DEVELOPER_TOKEN`).
  */
+function resolveGoogleAdsAppUrl(rawEnv: Record<string, string | undefined>): string {
+  return rawEnv.NEXT_PUBLIC_APP_URL?.trim() ||
+    (rawEnv.NEXT_PUBLIC_APP_DOMAIN?.trim()
+      ? `https://${rawEnv.NEXT_PUBLIC_APP_DOMAIN.trim()}`
+      : "http://localhost:3000");
+}
+
 export function getGoogleAdsOAuthConfigurationStatus(
   rawEnv: Record<string, string | undefined> = process.env
 ): GoogleAdsOAuthConfigStatus {
@@ -285,11 +271,7 @@ export function getGoogleAdsOAuthConfigurationStatus(
     missingVariables.push("GOOGLE_ADS_CLIENT_SECRET");
   }
 
-  const appUrl =
-    rawEnv.NEXT_PUBLIC_APP_URL?.trim() ||
-    (rawEnv.NEXT_PUBLIC_APP_DOMAIN?.trim()
-      ? `https://${rawEnv.NEXT_PUBLIC_APP_DOMAIN.trim()}`
-      : "http://localhost:3000");
+  const appUrl = resolveGoogleAdsAppUrl(rawEnv);
 
   const callbackCheck = validateOfficialGoogleAdsCallbackUrl(appUrl, rawEnv);
 
@@ -335,9 +317,7 @@ export function requireGoogleAdsOAuthConfig(
   }
 
   const stateSigningSecret = requireOAuthStateSigningSecret(rawEnv);
-  const appUrl = (
-    rawEnv.NEXT_PUBLIC_APP_URL?.trim() || "http://localhost:3000"
-  ).replace(/\/+$/, "");
+  const appUrl = resolveGoogleAdsAppUrl(rawEnv).replace(/\/+$/, "");
 
   const callbackCheck = validateOfficialGoogleAdsCallbackUrl(appUrl, rawEnv);
   if (!callbackCheck.valid) {
