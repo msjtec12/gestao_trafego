@@ -239,6 +239,41 @@ export function isCloudProjectNotApprovedForProductionError(
 }
 
 /**
+ * Extracts a safe, sanitized human-readable error summary from Google Ads REST JSON error payloads
+ * (e.g. `INVALID_ARGUMENT: ...` or specific Google Ads `errorCode` + `message`).
+ */
+export function extractGoogleAdsApiErrorSummary(responseBody: string): string {
+  try {
+    const parsed = JSON.parse(responseBody) as {
+      error?: {
+        status?: string;
+        message?: string;
+        details?: Array<{
+          errors?: Array<{
+            errorCode?: Record<string, string>;
+            message?: string;
+          }>;
+        }>;
+      };
+    };
+    const detailErr = parsed.error?.details?.[0]?.errors?.[0];
+    if (detailErr) {
+      const codeEntry = detailErr.errorCode
+        ? Object.entries(detailErr.errorCode)[0]
+        : undefined;
+      const codeStr = codeEntry ? `${codeEntry[0]}.${codeEntry[1]}` : "";
+      const msgStr = detailErr.message?.trim() ?? "";
+      return [codeStr, msgStr].filter(Boolean).join(": ").slice(0, 260);
+    }
+    const status = parsed.error?.status?.trim() ?? "";
+    const message = parsed.error?.message?.trim() ?? "";
+    return [status, message].filter(Boolean).join(": ").slice(0, 260);
+  } catch {
+    return "";
+  }
+}
+
+/**
  * Builds official Google Ads API v26 READ_ONLY REST headers.
  * Per the September 9, 2026 official Google Ads API update, authorization and access level
  * are linked directly to the Google Cloud project via OAuth 2.0 (`Authorization: Bearer ...`).
@@ -938,7 +973,6 @@ export class PersistentPostgresGoogleAdsService {
       gaqlQuery,
       managerCustomerId: explicitManagerCustomerId,
       developerToken,
-      pageSize = 10_000,
       maxPages = 10,
       customPinnedExecutor,
       dnsResolver,
@@ -986,9 +1020,10 @@ export class PersistentPostgresGoogleAdsService {
 
       while (true) {
         try {
+          // NOTE: Google Ads API v19+ (including v26) removed `pageSize` from SearchGoogleAdsRequest
+          // and enforces a fixed 10,000-row page size. Sending `pageSize` causes HTTP 400 INVALID_ARGUMENT.
           const payload: Record<string, unknown> = {
             query: trimmedQuery,
-            pageSize,
           };
           if (pageToken) {
             payload.pageToken = pageToken;
@@ -1017,20 +1052,26 @@ export class PersistentPostgresGoogleAdsService {
           }
 
           if (resp.statusCode === 401 || resp.statusCode === 403) {
+            const detail = extractGoogleAdsApiErrorSummary(resp.bodyText);
             throw new ProviderIntegrationError(
               "GOOGLE_ADS",
               "AUTH_TOKEN_REVOKED",
               false,
-              `Google Ads API authentication/permission error HTTP ${resp.statusCode}.`
+              detail
+                ? `Google Ads API HTTP ${resp.statusCode}: ${detail}`
+                : `Google Ads API authentication/permission error HTTP ${resp.statusCode}.`
             );
           }
 
           if (resp.statusCode !== 200) {
+            const detail = extractGoogleAdsApiErrorSummary(resp.bodyText);
             throw new ProviderIntegrationError(
               "GOOGLE_ADS",
               "POLICY_VIOLATION",
               false,
-              `Google Ads API error HTTP ${resp.statusCode}.`
+              detail
+                ? `Google Ads API HTTP ${resp.statusCode}: ${detail}`
+                : `Google Ads API error HTTP ${resp.statusCode}.`
             );
           }
 

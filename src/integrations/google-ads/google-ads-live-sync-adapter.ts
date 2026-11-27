@@ -349,29 +349,43 @@ export class GoogleAdsLiveSyncAdapter {
     });
 
     const discoveredMap = new Map<string, DiscoveredGoogleAdsAccount>();
+    let lastError: unknown = null;
 
     for (const rootCustomerId of accessibleIds) {
-      const rows = await this.withAutoRefresh({
-        context: params.context,
-        integrationId: params.integrationId,
-        oauthClientId: params.oauthClientId,
-        oauthClientSecret: params.oauthClientSecret,
-        customPinnedExecutor: params.customPinnedExecutor,
-        dnsResolver: params.dnsResolver,
-        execute: () =>
-          this.googleService.executeReadOnlyGaqlSearchViaRest<GaqlCustomerClientRow>(
-            {
-              context: params.context,
-              integrationId: params.integrationId,
-              customerId: rootCustomerId,
-              managerCustomerId: rootCustomerId,
-              gaqlQuery:
-                "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.time_zone, customer_client.manager, customer_client.status, customer_client.level FROM customer_client WHERE customer_client.level <= 1 AND customer_client.status = 'ENABLED'",
-              customPinnedExecutor: params.customPinnedExecutor,
-              dnsResolver: params.dnsResolver,
-            }
-          ),
-      });
+      let rows: GaqlCustomerClientRow[] = [];
+      try {
+        rows = await this.withAutoRefresh({
+          context: params.context,
+          integrationId: params.integrationId,
+          oauthClientId: params.oauthClientId,
+          oauthClientSecret: params.oauthClientSecret,
+          customPinnedExecutor: params.customPinnedExecutor,
+          dnsResolver: params.dnsResolver,
+          execute: () =>
+            this.googleService.executeReadOnlyGaqlSearchViaRest<GaqlCustomerClientRow>(
+              {
+                context: params.context,
+                integrationId: params.integrationId,
+                customerId: rootCustomerId,
+                managerCustomerId: rootCustomerId,
+                gaqlQuery:
+                  "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.time_zone, customer_client.manager, customer_client.status, customer_client.level FROM customer_client WHERE customer_client.level <= 1 AND customer_client.status = 'ENABLED'",
+                customPinnedExecutor: params.customPinnedExecutor,
+                dnsResolver: params.dnsResolver,
+              }
+            ),
+        });
+      } catch (err) {
+        // Propagate cloud-project approval error immediately; skip inaccessible/cancelled individual roots
+        if (
+          err instanceof Error &&
+          err.name === "GoogleAdsCloudProjectApprovalError"
+        ) {
+          throw err;
+        }
+        lastError = err;
+        continue;
+      }
 
       for (const row of rows) {
         const cc = row.customerClient;
@@ -397,6 +411,10 @@ export class GoogleAdsLiveSyncAdapter {
           });
         }
       }
+    }
+
+    if (discoveredMap.size === 0 && lastError) {
+      throw lastError;
     }
 
     return Array.from(discoveredMap.values());
