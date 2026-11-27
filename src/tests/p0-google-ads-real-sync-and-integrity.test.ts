@@ -237,6 +237,8 @@ describe("P0 Critical Fix — Real Google Ads Live Sync, Metric Precision & Anti
                 ],
                 customPinnedExecutor: async (req) => {
                   const q = req.body ?? "";
+                  // Regression guard: Google Ads API v19+/v26 rejects `pageSize` with HTTP 400
+                  expect(q).not.toContain('"pageSize"');
                   if (q.includes("FROM customer LIMIT 1")) {
                     return {
                       statusCode: 200,
