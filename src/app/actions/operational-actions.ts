@@ -1,7 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   withAdminPostgresTransaction,
@@ -14,7 +14,17 @@ import {
   PersistentDrizzleTenantRepository,
   switchActiveOrganizationInPostgres,
 } from "@/infrastructure/db/repositories/drizzle-tenant-repositories";
-import { PersistentPostgresGoogleAdsService } from "@/integrations/google-ads/google-ads-oauth-and-readonly";
+import {
+  normalizeGoogleAdsCustomerId,
+  PersistentPostgresGoogleAdsService,
+} from "@/integrations/google-ads/google-ads-oauth-and-readonly";
+import {
+  GoogleAdsLiveSyncAdapter,
+  validateSyncDateRange,
+  type DiscoveredGoogleAdsAccount,
+} from "@/integrations/google-ads/google-ads-live-sync-adapter";
+import { PersistentPostgresAdsSyncEngine } from "@/workflows/incremental-sync-engine";
+import { assertVerifiedOperationalDataForAI } from "@/infrastructure/db/reconciliation/data-integrity-reconciler";
 import {
   PersistentAIRecommendationsAndReportsRepository,
   type PersistedExecutiveReport,
@@ -24,7 +34,10 @@ import {
   resolveUnifiedAuthJsPostgresSession,
   revokeUnifiedAuthJsSession,
 } from "@/security/auth";
-import { requireCredentialsEncryptionKey } from "@/security/env";
+import {
+  requireCredentialsEncryptionKey,
+  requireGoogleAdsOAuthConfig,
+} from "@/security/env";
 import { toPublicSafeErrorMessage } from "@/security/public-errors";
 import {
   createRequestCorrelationId,
@@ -462,44 +475,355 @@ export async function toggleEmergencyStopServerAction(): Promise<{
   }
 }
 
-export async function requestSyncServerAction(
+const BindGoogleAdsAccountSchema = z.object({
+  integrationId: z.string().uuid("ID da integração inválido."),
+  clientId: z.string().uuid("Selecione um cliente explícito para vincular a conta."),
+  externalAccountId: z.string().min(10, "Informe um Customer ID Google Ads de 10 dígitos."),
+  accountName: z.string().min(2).max(160),
+  managerCustomerId: z.string().nullable().optional(),
+  isMccAccount: z.boolean().default(false),
+  currencyCode: z.string().length(3).default("BRL"),
+  timezone: z.string().min(3).max(64).default("America/Sao_Paulo"),
+});
+
+/**
+ * Discovers real authorized Google Ads accounts (individual and MCC hierarchies)
+ * directly from the official Google Ads API (`listAccessibleCustomers` + `customer_client`).
+ * Never auto-assigns accounts to clients.
+ */
+export async function discoverGoogleAdsAccountsServerAction(
   integrationId: string
-): Promise<{ readonly ok: boolean; readonly error?: string }> {
+): Promise<{
+  readonly ok: boolean;
+  readonly accounts?: readonly DiscoveredGoogleAdsAccount[];
+  readonly error?: string;
+}> {
   try {
+    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
+    const oauthConfig = requireGoogleAdsOAuthConfig();
     const session = await resolveUnifiedAuthJsPostgresSession();
-    return await withTenantTransaction(session.context, async (tx) => {
-      const repo = new PersistentDrizzleTenantRepository(tx);
-      const integrations = await repo.listPublicIntegrations(session.context);
-      if (!integrations.some((integration) => integration.id === integrationId)) {
-        return { ok: false, error: "Integração não encontrada na organização ativa." };
+
+    const accounts = await withTenantTransaction(
+      session.context,
+      async (tx) => {
+        const repo = new PersistentDrizzleTenantRepository(tx);
+        const integrations = await repo.listPublicIntegrations(session.context);
+        const target = integrations.find((i) => i.id === integrationId);
+        if (!target || target.provider !== "GOOGLE_ADS") {
+          throw new Error("Integração Google Ads não encontrada na organização ativa.");
+        }
+        if (target.status !== "CONNECTED") {
+          throw new Error(
+            "Integração Google Ads não está conectada. Conclua a autorização OAuth 2.0 antes de descobrir contas."
+          );
+        }
+
+        const googleService = new PersistentPostgresGoogleAdsService(
+          tx,
+          keyHex,
+          keyVersion
+        );
+        const adapter = new GoogleAdsLiveSyncAdapter(googleService);
+        return await adapter.discoverAuthorizedAccounts({
+          context: session.context,
+          integrationId: target.id,
+          oauthClientId: oauthConfig.clientId,
+          oauthClientSecret: oauthConfig.clientSecret,
+        });
       }
-      // Fail closed until a validated, account-scoped GAQL adapter is wired into this action.
-      // OAuth token availability alone does not establish metric provenance.
-      return {
-        ok: false,
-        error: "Sincronização temporariamente bloqueada: a importação de métricas reais ainda precisa ser validada. Nenhum dado demonstrativo será gravado.",
-      };
-    });
+    );
+
+    return { ok: true, accounts };
   } catch (err) {
     return {
       ok: false,
-      error: toPublicSafeErrorMessage(err).publicMessage,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível descobrir as contas autorizadas na Google Ads API."
+      ).publicMessage,
     };
   }
 }
 
-async function hasUnverifiedCampaignData(
-  tx: import("@/infrastructure/db").DrizzleQueryExecutor,
-  organizationId: string
-): Promise<boolean> {
-  const rows = await tx.select({ id: schema.campaigns.id })
-    .from(schema.campaigns)
-    .where(sql`${schema.campaigns.organizationId} = ${organizationId}
-      AND (${schema.campaigns.isDemoData} = true OR
-      (${schema.campaigns.provider} = 'GOOGLE_ADS' AND
-      ${schema.campaigns.externalCampaignId} !~ '^[0-9]+$'))`)
-    .limit(1);
-  return rows.length > 0;
+/**
+ * Explicitly binds a real discovered Google Ads customer_id to an explicitly chosen client.
+ * Never assigns automatically to `clients[0]`.
+ */
+export async function bindGoogleAdsAccountToClientServerAction(rawInput: {
+  readonly integrationId: string;
+  readonly clientId: string;
+  readonly externalAccountId: string;
+  readonly accountName: string;
+  readonly managerCustomerId?: string | null;
+  readonly isMccAccount?: boolean;
+  readonly currencyCode?: string;
+  readonly timezone?: string;
+}): Promise<{
+  readonly ok: boolean;
+  readonly adAccountId?: string;
+  readonly error?: string;
+}> {
+  try {
+    const parsed = BindGoogleAdsAccountSchema.safeParse(rawInput);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error:
+          parsed.error.issues[0]?.message ??
+          "Dados inválidos para vincular conta Google Ads ao cliente.",
+      };
+    }
+
+    const normalizedCustomerId = normalizeGoogleAdsCustomerId(
+      parsed.data.externalAccountId
+    );
+    const normalizedManagerId = parsed.data.managerCustomerId
+      ? normalizeGoogleAdsCustomerId(parsed.data.managerCustomerId)
+      : null;
+
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    const adAccountId = await withTenantTransaction(
+      session.context,
+      async (tx) => {
+        const repo = new PersistentDrizzleTenantRepository(tx);
+        const clients = await repo.listClients(session.context);
+        const targetClient = clients.find((c) => c.id === parsed.data.clientId);
+        if (!targetClient) {
+          throw new Error(
+            "Cliente informado não encontrado ou sem permissão nesta organização."
+          );
+        }
+
+        const integrations = await repo.listPublicIntegrations(session.context);
+        const targetIntegration = integrations.find(
+          (i) => i.id === parsed.data.integrationId
+        );
+        if (!targetIntegration || targetIntegration.provider !== "GOOGLE_ADS") {
+          throw new Error("Integração Google Ads não encontrada.");
+        }
+
+        const existing = await tx
+          .select()
+          .from(schema.adAccounts)
+          .where(
+            and(
+              eq(schema.adAccounts.organizationId, session.context.organizationId),
+              eq(schema.adAccounts.provider, "GOOGLE_ADS"),
+              eq(schema.adAccounts.externalAccountId, normalizedCustomerId)
+            )
+          );
+
+        let accountId: string;
+        if (existing[0]) {
+          accountId = existing[0].id;
+          await tx
+            .update(schema.adAccounts)
+            .set({
+              clientId: targetClient.id,
+              integrationId: targetIntegration.id,
+              name: parsed.data.accountName.trim(),
+              managerCustomerId: normalizedManagerId,
+              isMccAccount: parsed.data.isMccAccount,
+              isSelectedForSync: !parsed.data.isMccAccount,
+              currencyCode: parsed.data.currencyCode.toUpperCase(),
+              timezone: parsed.data.timezone,
+              isDemoData: false,
+              updatedAt: new Date(),
+            })
+            .where(eq(schema.adAccounts.id, accountId));
+        } else {
+          const [inserted] = await tx
+            .insert(schema.adAccounts)
+            .values({
+              organizationId: session.context.organizationId,
+              clientId: targetClient.id,
+              integrationId: targetIntegration.id,
+              provider: "GOOGLE_ADS",
+              externalAccountId: normalizedCustomerId,
+              managerCustomerId: normalizedManagerId,
+              isMccAccount: parsed.data.isMccAccount,
+              isSelectedForSync: !parsed.data.isMccAccount,
+              name: parsed.data.accountName.trim(),
+              currencyCode: parsed.data.currencyCode.toUpperCase(),
+              timezone: parsed.data.timezone,
+              isDemoData: false,
+            })
+            .returning();
+          if (!inserted) {
+            throw new Error("Falha ao vincular conta Google Ads.");
+          }
+          accountId = inserted.id;
+        }
+
+        await tx.insert(schema.auditLogs).values({
+          organizationId: session.context.organizationId,
+          actorUserId: session.context.userId,
+          actorType: "USER",
+          action: "AD_ACCOUNT_BOUND_TO_CLIENT",
+          entityType: "ad_account",
+          entityId: accountId,
+          newState: {
+            clientId: targetClient.id,
+            externalAccountId: normalizedCustomerId,
+            managerCustomerId: normalizedManagerId,
+            isMccAccount: parsed.data.isMccAccount,
+            currencyCode: parsed.data.currencyCode.toUpperCase(),
+            timezone: parsed.data.timezone,
+          },
+        });
+
+        return accountId;
+      }
+    );
+
+    revalidatePath("/");
+    return { ok: true, adAccountId };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível vincular a conta Google Ads ao cliente."
+      ).publicMessage,
+    };
+  }
+}
+
+function getDefaultDateWindowForTimezone(
+  timezone: string,
+  days = 7
+): { readonly startDate: string; readonly endDate: string } {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone || "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const now = new Date();
+  const endDate = formatter.format(now);
+  const start = new Date(now.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+  const startDate = formatter.format(start);
+  return { startDate, endDate };
+}
+
+/**
+ * Executes a REAL READ_ONLY Google Ads API v26 synchronization for explicitly bound
+ * and selected ad accounts. ZERO synthetic/hardcoded/mock fallbacks.
+ */
+export async function requestSyncServerAction(
+  integrationId: string,
+  options?: {
+    readonly adAccountId?: string;
+    readonly startDate?: string;
+    readonly endDate?: string;
+  }
+): Promise<{
+  readonly ok: boolean;
+  readonly syncedAccounts?: number;
+  readonly error?: string;
+}> {
+  try {
+    const { keyHex, keyVersion } = requireCredentialsEncryptionKey();
+    const oauthConfig = requireGoogleAdsOAuthConfig();
+    const session = await resolveUnifiedAuthJsPostgresSession();
+
+    const syncedAccounts = await withTenantTransaction(
+      session.context,
+      async (tx) => {
+        const repo = new PersistentDrizzleTenantRepository(tx);
+        const integrations = await repo.listPublicIntegrations(session.context);
+        const targetIntegration = integrations.find(
+          (i) => i.id === integrationId
+        );
+        if (!targetIntegration) {
+          throw new Error("Integração não encontrada na organização ativa.");
+        }
+        if (targetIntegration.provider !== "GOOGLE_ADS") {
+          throw new Error(
+            "Sincronização ao vivo suportada atualmente apenas para Google Ads API v26 (READ_ONLY)."
+          );
+        }
+        if (targetIntegration.status !== "CONNECTED") {
+          throw new Error(
+            "Integração Google Ads não está conectada. Autorize via OAuth 2.0 antes de sincronizar."
+          );
+        }
+
+        const boundAccounts = await repo.listAdAccounts(session.context);
+        const eligibleAccounts = boundAccounts.filter((acc) => {
+          if (acc.integrationId !== targetIntegration.id) return false;
+          if (options?.adAccountId && acc.id !== options.adAccountId) {
+            return false;
+          }
+          if (!acc.isSelectedForSync || acc.isMccAccount) return false;
+          if (!/^\d{10}$/.test(acc.externalAccountId)) return false;
+          if (acc.isDemoData) return false;
+          return true;
+        });
+
+        if (eligibleAccounts.length === 0) {
+          throw new Error(
+            "Nenhuma conta Google Ads oficial está vinculada explicitamente a um cliente e selecionada para sincronização. Descubra e vincule uma conta real antes de sincronizar."
+          );
+        }
+
+        const googleService = new PersistentPostgresGoogleAdsService(
+          tx,
+          keyHex,
+          keyVersion
+        );
+        const adapter = new GoogleAdsLiveSyncAdapter(googleService);
+        const syncEngine = new PersistentPostgresAdsSyncEngine(tx);
+
+        for (const account of eligibleAccounts) {
+          const range =
+            options?.startDate && options?.endDate
+              ? validateSyncDateRange({
+                  startDate: options.startDate,
+                  endDate: options.endDate,
+                })
+              : getDefaultDateWindowForTimezone(account.timezone, 7);
+
+          const runResult = await syncEngine.executePersistentSync({
+            context: session.context,
+            integrationId: targetIntegration.id,
+            clientId: account.clientId,
+            provider: "GOOGLE_ADS",
+            fetchBatchFn: async () =>
+              await adapter.fetchLiveAccountBatch({
+                context: session.context,
+                integrationId: targetIntegration.id,
+                customerId: account.externalAccountId,
+                managerCustomerId: account.managerCustomerId,
+                startDate: range.startDate,
+                endDate: range.endDate,
+                oauthClientId: oauthConfig.clientId,
+                oauthClientSecret: oauthConfig.clientSecret,
+              }),
+          });
+
+          if (runResult.status === "FAILED") {
+            throw new Error(
+              `Sincronização oficial falhou para a conta ${account.externalAccountId}. Nenhum dado incompleto foi marcado como concluído.`
+            );
+          }
+        }
+
+        return eligibleAccounts.length;
+      }
+    );
+
+    revalidatePath("/");
+    return { ok: true, syncedAccounts };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(
+        err,
+        "Não foi possível sincronizar os dados reais do Google Ads."
+      ).publicMessage,
+    };
+  }
 }
 
 const ReviewRecommendationInputSchema = z.object({
@@ -526,9 +850,10 @@ export async function runSupervisedAIAnalysisServerAction(rawInput?: {
   try {
     const session = await resolveUnifiedAuthJsPostgresSession();
     const result = await withTenantTransaction(session.context, async (tx) => {
-      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
-        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
-      }
+      await assertVerifiedOperationalDataForAI(
+        tx,
+        session.context.organizationId
+      );
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.runSupervisedAIAnalysisAndPersist(session.context, {
         clientId: rawInput?.clientId,
@@ -576,9 +901,10 @@ export async function reviewRecommendationServerAction(rawInput: {
 
     const session = await resolveUnifiedAuthJsPostgresSession();
     const result = await withTenantTransaction(session.context, async (tx) => {
-      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
-        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
-      }
+      await assertVerifiedOperationalDataForAI(
+        tx,
+        session.context.organizationId
+      );
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.reviewRecommendationWithPayloadBoundApproval(
         session.context,
@@ -626,9 +952,10 @@ export async function generateExecutiveReportServerAction(rawInput: {
 
     const session = await resolveUnifiedAuthJsPostgresSession();
     const report = await withTenantTransaction(session.context, async (tx) => {
-      if (await hasUnverifiedCampaignData(tx, session.context.organizationId)) {
-        throw new Error("Dados de campanhas não verificados. Operação bloqueada até reconciliação com a fonte oficial.");
-      }
+      await assertVerifiedOperationalDataForAI(
+        tx,
+        session.context.organizationId
+      );
       const repo = new PersistentAIRecommendationsAndReportsRepository(tx);
       return await repo.generateAndPersistExecutiveReport(
         session.context,

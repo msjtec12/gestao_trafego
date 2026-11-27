@@ -11,6 +11,10 @@ import {
   type PersistedExecutiveReport,
   type PersistedRecommendationWithApproval,
 } from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
+import {
+  auditOrganizationDataIntegrity,
+  type OrganizationDataIntegrityReport,
+} from "@/infrastructure/db/reconciliation/data-integrity-reconciler";
 import { resolveUnifiedAuthJsPostgresSession } from "@/security/auth";
 import {
   getGoogleAdsOAuthConfigurationStatus,
@@ -140,6 +144,7 @@ export interface DashboardOverviewViewModel {
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
   readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
+  readonly dataIntegrity?: OrganizationDataIntegrityReport;
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly aggregatedMetrics?: AggregatedPeriodMetricsResult;
@@ -180,6 +185,10 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
     });
     const syncRunRows = await repo.listSyncRuns(session.context);
     const auditRows = await repo.listAuditLogs(session.context, 25);
+    const dataIntegrity = await auditOrganizationDataIntegrity(
+      tx,
+      session.context.organizationId
+    );
 
     const aiRepo = new PersistentAIRecommendationsAndReportsRepository(tx);
     const persistedRecommendations = await aiRepo.listRecommendations(
@@ -449,6 +458,7 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
       members: membersVm,
       integrations: integrationsVm,
       googleAdsConfigStatus: getGoogleAdsOAuthConfigurationStatus(),
+      dataIntegrity,
       campaigns: normalizedCampaigns,
       dailyMetrics: [...aggregated.timeline],
       aggregatedMetrics: aggregated,

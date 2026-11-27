@@ -28,13 +28,16 @@ import type {
   SyncRunViewModel,
 } from "@/application/use-cases/dashboard-overview-use-case";
 import {
+  bindGoogleAdsAccountToClientServerAction,
   createClientServerAction,
   deactivateClientServerAction,
+  discoverGoogleAdsAccountsServerAction,
   requestSyncServerAction,
   revokeIntegrationServerAction,
   toggleAdAccountSelectionServerAction,
   updateClientServerAction,
 } from "@/app/actions/operational-actions";
+import type { DiscoveredGoogleAdsAccount } from "@/integrations/google-ads/google-ads-live-sync-adapter";
 import { formatCurrencyBrl } from "@/lib/utils";
 import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
 import { Badge } from "@/components/ui/badge";
@@ -91,6 +94,14 @@ export function TenantManagementHub({
   const [editingClientId, setEditingClientId] = React.useState<string | null>(
     null
   );
+  const [discoveredAccounts, setDiscoveredAccounts] = React.useState<
+    readonly DiscoveredGoogleAdsAccount[]
+  >([]);
+  const [discoveringIntegrationId, setDiscoveringIntegrationId] =
+    React.useState<string | null>(null);
+  const [bindingClientByAccount, setBindingClientByAccount] = React.useState<
+    Record<string, string>
+  >({});
   const [editName, setEditName] = React.useState("");
   const [editIndustry, setEditIndustry] = React.useState("");
   const [editBudgetBrl, setEditBudgetBrl] = React.useState("");
@@ -215,6 +226,67 @@ export function TenantManagementHub({
       }
       setStatusBanner(
         "Credenciais revogadas e removidas do Credential Vault no PostgreSQL."
+      );
+      router.refresh();
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleDiscoverAccounts = async (integrationId: string) => {
+    setFormError(null);
+    setStatusBanner(null);
+    setDiscoveringIntegrationId(integrationId);
+    try {
+      const res = await discoverGoogleAdsAccountsServerAction(integrationId);
+      if (!res.ok || !res.accounts) {
+        setFormError(
+          res.error ?? "Não foi possível descobrir as contas Google Ads."
+        );
+        return;
+      }
+      setDiscoveredAccounts(res.accounts);
+      setStatusBanner(
+        `${res.accounts.length} conta(s) Google Ads descoberta(s). Selecione explicitamente o cliente para vincular cada conta.`
+      );
+    } finally {
+      setDiscoveringIntegrationId(null);
+    }
+  };
+
+  const handleBindDiscoveredAccount = async (
+    integrationId: string,
+    acc: DiscoveredGoogleAdsAccount
+  ) => {
+    const selectedClientId = bindingClientByAccount[acc.customerId];
+    if (!selectedClientId) {
+      setFormError(
+        `Selecione explicitamente um cliente antes de vincular a conta ${acc.customerId}.`
+      );
+      return;
+    }
+    setFormError(null);
+    setStatusBanner(null);
+    setIsSubmitting(true);
+    try {
+      const res = await bindGoogleAdsAccountToClientServerAction({
+        integrationId,
+        clientId: selectedClientId,
+        externalAccountId: acc.customerId,
+        accountName: acc.descriptiveName,
+        managerCustomerId: acc.managerCustomerId,
+        isMccAccount: acc.isManager,
+        currencyCode: acc.currencyCode,
+        timezone: acc.timeZone,
+      });
+      if (!res.ok) {
+        setFormError(
+          res.error ?? "Não foi possível vincular a conta ao cliente."
+        );
+        return;
+      }
+      setStatusBanner(
+        `Conta Google Ads ${acc.customerId} (${acc.descriptiveName}) vinculada com sucesso.`
       );
       router.refresh();
     } finally {
@@ -751,6 +823,22 @@ export function TenantManagementHub({
                           </a>
                         )}
 
+                      {intg.provider === "GOOGLE_ADS" &&
+                        !activeOrganization.isDemo &&
+                        intg.status === "CONNECTED" && (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={discoveringIntegrationId === intg.id}
+                            onClick={() => handleDiscoverAccounts(intg.id)}
+                          >
+                            {discoveringIntegrationId === intg.id
+                              ? "Descobrindo Contas..."
+                              : "Descobrir Contas Reais"}
+                          </Button>
+                        )}
+
                       <Button
                         type="button"
                         variant="outline"
@@ -781,6 +869,64 @@ export function TenantManagementHub({
                       )}
                     </div>
                   </div>
+
+                  {intg.provider === "GOOGLE_ADS" &&
+                    discoveredAccounts.length > 0 && (
+                      <div className="rounded-lg border border-cyan-500/30 bg-cyan-500/5 p-3 space-y-2">
+                        <p className="font-semibold text-xs text-slate-900 dark:text-slate-100">
+                          Contas Google Ads Autorizadas ({discoveredAccounts.length}) — Vincule Explicitamente a um Cliente
+                        </p>
+                        {discoveredAccounts.map((acc) => (
+                          <div
+                            key={acc.customerId}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950/70 px-3 py-2"
+                          >
+                            <div>
+                              <p className="font-semibold text-xs">
+                                {acc.descriptiveName}{" "}
+                                <code className="text-cyan-600 dark:text-cyan-400">
+                                  ({acc.customerId})
+                                </code>
+                              </p>
+                              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                                {acc.isManager ? "MCC (Gerenciadora)" : "Conta Anunciante"} · {acc.currencyCode} · {acc.timeZone}
+                                {acc.managerCustomerId ? ` · MCC ${acc.managerCustomerId}` : ""}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <select
+                                aria-label={`Selecionar cliente para conta ${acc.customerId}`}
+                                value={bindingClientByAccount[acc.customerId] ?? ""}
+                                onChange={(e) =>
+                                  setBindingClientByAccount((prev) => ({
+                                    ...prev,
+                                    [acc.customerId]: e.target.value,
+                                  }))
+                                }
+                                className="h-8 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 px-2 text-xs"
+                              >
+                                <option value="">Selecione o cliente...</option>
+                                {clients.map((c) => (
+                                  <option key={c.id} value={c.id}>
+                                    {c.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <Button
+                                type="button"
+                                size="sm"
+                                disabled={isSubmitting || acc.isManager}
+                                onClick={() =>
+                                  handleBindDiscoveredAccount(intg.id, acc)
+                                }
+                              >
+                                {acc.isManager ? "MCC" : "Vincular Conta"}
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
 
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-2 border-t border-slate-200 dark:border-slate-800 text-[11px] text-slate-500 dark:text-slate-400">
                     <div>

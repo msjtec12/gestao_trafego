@@ -61,6 +61,7 @@ export default async function HomePage({
       integrations={vm.integrations}
       googleAdsConfigStatus={vm.googleAdsConfigStatus}
       googleAdsNotice={googleAdsNotice}
+      dataIntegrity={vm.dataIntegrity}
       syncHistory={vm.syncHistory}
       auditTrail={vm.auditTrail}
       campaigns={vm.campaigns}

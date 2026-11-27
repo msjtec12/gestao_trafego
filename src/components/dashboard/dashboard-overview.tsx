@@ -44,6 +44,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
+import type { OrganizationDataIntegrityReport } from "@/infrastructure/db/reconciliation/data-integrity-reconciler";
 import { PerformanceChart } from "./performance-chart";
 import { CampaignsTable } from "./campaigns-table";
 import { AIRecommendationsPanel } from "./ai-recommendations-panel";
@@ -60,6 +61,7 @@ export interface DashboardOverviewProps {
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
   readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
+  readonly dataIntegrity?: OrganizationDataIntegrityReport;
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
@@ -127,6 +129,7 @@ export function DashboardOverview({
   members,
   integrations,
   googleAdsConfigStatus,
+  dataIntegrity,
   syncHistory = [],
   auditTrail = [],
   campaigns,
@@ -621,7 +624,13 @@ export function DashboardOverview({
       </section>
 
       <section id="campaigns">
-        <CampaignsTable campaigns={scopedCampaigns} />
+        <CampaignsTable
+          campaigns={scopedCampaigns}
+          lastVerifiedSyncAtIso={dataIntegrity?.lastVerifiedSyncAtIso ?? null}
+          isStale={dataIntegrity?.isStale ?? false}
+          isContaminated={dataIntegrity?.isContaminated ?? false}
+          periodLabel={`Últimos ${periodWindowDays} dias`}
+        />
       </section>
 
       <section id="ai-recommendations" className="space-y-6">
