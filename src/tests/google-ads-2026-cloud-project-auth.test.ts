@@ -92,6 +92,32 @@ describe("Google Ads API — September 9, 2026 Cloud Project Authorization Updat
     ).toThrow(/GOOGLE_ADS_CLIENT_SECRET/);
   });
 
+  it("rejects unsafe callback origins and keeps status aligned with OAuth configuration", () => {
+    const env = {
+      NODE_ENV: "production",
+      NEXT_PUBLIC_APP_DOMAIN: "ads.konnexy.com.br",
+      GOOGLE_ADS_CLIENT_ID: "1234567890-abc.apps.googleusercontent.com",
+      GOOGLE_ADS_CLIENT_SECRET: "GOCSPX-valid-secret-value",
+      AUTH_SECRET: crypto.randomBytes(32).toString("hex"),
+    };
+    const status = getGoogleAdsOAuthConfigurationStatus(env);
+    expect(status.configured).toBe(true);
+    expect(requireGoogleAdsOAuthConfig(env).redirectUri).toBe(status.callbackUrl);
+    for (const origin of [
+      "https://user:password@ads.konnexy.com.br",
+      "https://ads.konnexy.com.br?x=1",
+      "https://ads.konnexy.com.br#fragment",
+      "https://ads.konnexy.com.br/subpath",
+      "https://localhost",
+      "ftp://localhost",
+    ]) {
+      const result = validateOfficialGoogleAdsCallbackUrl(origin, env);
+      expect(result.valid).toBe(false);
+      expect(result.callbackUrl).toBe("");
+    }
+    expect(validateOfficialGoogleAdsCallbackUrl("http://localhost:3000", { NODE_ENV: "test" }).valid).toBe(true);
+  });
+
   it("detects CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION in REST responses and returns friendly pt-BR guidance", async () => {
     const rawGoogleErrorBody = JSON.stringify({
       error: {
