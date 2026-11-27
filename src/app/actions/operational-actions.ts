@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { sql } from "drizzle-orm";
 import { z } from "zod";
 import {
   withAdminPostgresTransaction,
@@ -86,6 +87,7 @@ export async function loginUserAction(rawInput: {
 
     currentStep = "authenticate_user_postgres";
     const session = await withAdminPostgresTransaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
       return await authenticateUserWithPostgres(tx, parsed.data);
     });
 
@@ -128,6 +130,7 @@ export async function onboardOrganizationAction(rawInput: {
   readonly ok: boolean;
   readonly error?: string;
   readonly errorCode?: string;
+  readonly failedStep?: string;
   readonly requestId?: string;
 }> {
   const requestId = createRequestCorrelationId();
@@ -135,6 +138,9 @@ export async function onboardOrganizationAction(rawInput: {
 
   try {
     const result = await withAdminPostgresTransaction(async (tx) => {
+      currentStep = "set_local_role_konnexy_app";
+      await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
+
       const onboarded = await onboardFirstOrganizationRepository(
         tx,
         {
@@ -185,6 +191,7 @@ export async function onboardOrganizationAction(rawInput: {
       ok: false,
       error: meta.publicMessage,
       errorCode: meta.errorCode,
+      failedStep: currentStep,
       requestId,
     };
   }
@@ -211,6 +218,7 @@ export async function switchOrganizationAction(
     const currentSession = await resolveUnifiedAuthJsPostgresSession();
     currentStep = "switch_active_organization_postgres";
     const updated = await withAdminPostgresTransaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
       return await switchActiveOrganizationInPostgres(tx, {
         sessionToken: currentSession.sessionToken,
         targetOrganizationId,

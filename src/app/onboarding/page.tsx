@@ -49,8 +49,11 @@ export default function OnboardingPage() {
       });
 
       if (!res.ok) {
-        const refSuffix = res.requestId ? ` (Ref.: ${res.requestId})` : "";
-        setError(`${res.error ?? "Erro ao criar organização."}${refSuffix}`);
+        const details: string[] = [];
+        if (res.failedStep) details.push(`Etapa: ${res.failedStep}`);
+        if (res.requestId) details.push(`Ref.: ${res.requestId}`);
+        const suffix = details.length > 0 ? ` (${details.join(" | ")})` : "";
+        setError(`${res.error ?? "Erro ao criar organização."}${suffix}`);
         return;
       }
 

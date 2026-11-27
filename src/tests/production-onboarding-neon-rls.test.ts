@@ -175,6 +175,89 @@ describe("Production Onboarding — Neon PG17 FORCE RLS, Atomicity, WebSocket & 
     }
   });
 
+  it("reproduces konnexy_runtime SQLSTATE 42501 on integrations insert and proves SET LOCAL ROLE konnexy_app resolves it", async () => {
+    const pg = new PGlite();
+    await applyAllMigrationsToPglite(pg);
+    try {
+      // 1. Without SET LOCAL ROLE konnexy_app, konnexy_runtime lacks direct privilege on `integrations` -> SQLSTATE 42501
+      let runtimeErr: unknown = null;
+      try {
+        await withAdminPostgresTransaction(
+          async (tx) => {
+            await tx.execute(sql`SET LOCAL ROLE konnexy_runtime`);
+            const created = await onboardFirstOrganizationRepository(tx, {
+              fullName: "Runtime Fail",
+              email: "runtime-fail@konnexy.com.br",
+              password: "StrongPassword!2026",
+              organizationName: "Runtime Fail Org",
+              organizationSlug: "runtime-fail-org",
+              timezone: "America/Sao_Paulo",
+              currencyCode: "BRL",
+            });
+            await tx.insert(schema.integrations).values({
+              organizationId: created.organization.id,
+              provider: "GOOGLE_ADS",
+              externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
+              status: "ERROR",
+              isDemoIntegration: false,
+            });
+          },
+          { customPg: pg }
+        );
+      } catch (err) {
+        runtimeErr = err;
+      }
+
+      expect(runtimeErr).toBeTruthy();
+      const meta = extractPostgresErrorMetadata(runtimeErr);
+      expect(meta.pgCode).toBe("42501");
+      expect(meta.category).toBe("INSUFFICIENT_PERMISSION_OR_RLS");
+
+      // 2. With SET LOCAL ROLE konnexy_app (from konnexy_runtime), the full onboarding + integrations + session flow succeeds
+      const onboarded = await withAdminPostgresTransaction(
+        async (tx) => {
+          await tx.execute(sql`SET LOCAL ROLE konnexy_runtime`);
+          await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
+          const created = await onboardFirstOrganizationRepository(tx, {
+            fullName: "Runtime Success",
+            email: "runtime-ok@konnexy.com.br",
+            password: "StrongPassword!2026",
+            organizationName: "Konnexy ADS",
+            organizationSlug: "konnexy-ads",
+            timezone: "America/Sao_Paulo",
+            currencyCode: "BRL",
+          });
+          await tx.insert(schema.integrations).values({
+            organizationId: created.organization.id,
+            provider: "GOOGLE_ADS",
+            externalAccountLabel: "Google Ads API v26 (OAuth 2.0 Read-Only)",
+            status: "ERROR",
+            isDemoIntegration: false,
+          });
+          return created;
+        },
+        { customPg: pg }
+      );
+
+      expect(onboarded.organization.slug).toBe("konnexy-ads");
+      expect(onboarded.membership.role).toBe("OWNER");
+
+      const resolved = await withAdminPostgresTransaction(
+        async (tx) => {
+          await tx.execute(sql`SET LOCAL ROLE konnexy_runtime`);
+          await tx.execute(sql`SET LOCAL ROLE konnexy_app`);
+          return await resolveSessionFromPostgres(tx, {
+            sessionToken: onboarded.sessionToken,
+          });
+        },
+        { customPg: pg }
+      );
+      expect(resolved.context.organizationId).toBe(onboarded.organization.id);
+    } finally {
+      await pg.close();
+    }
+  });
+
   it("guarantees full transactional atomicity (rolls back user/org/membership on mid-transaction failure)", async () => {
     const pg = await createNonSuperuserNeonSimulatedPg();
     try {
