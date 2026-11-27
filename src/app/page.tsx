@@ -6,7 +6,16 @@ import { AUTHJS_SESSION_COOKIE_NAME } from "@/middleware";
 
 export const dynamic = "force-dynamic";
 
-export default async function HomePage() {
+export default async function HomePage({
+  searchParams,
+}: {
+  readonly searchParams?: Promise<{
+    googleAdsStatus?: string;
+    googleAdsCode?: string;
+    googleAdsMessage?: string;
+  }>;
+}) {
+  const sp = searchParams ? await searchParams : {};
   const cookieStore = await cookies();
   const sessionToken =
     cookieStore.get(AUTHJS_SESSION_COOKIE_NAME)?.value ??
@@ -25,6 +34,19 @@ export default async function HomePage() {
     redirect("/login");
   }
 
+  const googleAdsNotice =
+    sp.googleAdsStatus === "connected" || sp.googleAdsStatus === "error"
+      ? {
+          status: sp.googleAdsStatus as "connected" | "error",
+          code: sp.googleAdsCode ?? null,
+          message:
+            sp.googleAdsMessage ??
+            (sp.googleAdsStatus === "connected"
+              ? "Google Ads conectado com sucesso em modo READ_ONLY."
+              : "Não foi possível concluir a autorização do Google Ads."),
+        }
+      : null;
+
   return (
     <DashboardShell
       organizationName={vm.organizationName}
@@ -37,6 +59,8 @@ export default async function HomePage() {
       adAccounts={vm.adAccounts}
       members={vm.members}
       integrations={vm.integrations}
+      googleAdsConfigStatus={vm.googleAdsConfigStatus}
+      googleAdsNotice={googleAdsNotice}
       syncHistory={vm.syncHistory}
       auditTrail={vm.auditTrail}
       campaigns={vm.campaigns}

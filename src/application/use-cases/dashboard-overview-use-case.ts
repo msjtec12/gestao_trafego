@@ -13,6 +13,10 @@ import {
 } from "@/infrastructure/db/repositories/ai-recommendations-reports-repository";
 import { resolveUnifiedAuthJsPostgresSession } from "@/security/auth";
 import {
+  getGoogleAdsOAuthConfigurationStatus,
+  type GoogleAdsOAuthConfigStatus,
+} from "@/security/env";
+import {
   GoogleAdsProvider,
   MockAdsProvider,
 } from "@/integrations/providers/ads-providers";
@@ -135,6 +139,7 @@ export interface DashboardOverviewViewModel {
   readonly adAccounts: readonly AdAccountRecordViewModel[];
   readonly members: readonly MemberRecordViewModel[];
   readonly integrations: readonly IntegrationHealthViewModel[];
+  readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
   readonly campaigns: NormalizedCampaign[];
   readonly dailyMetrics: NormalizedDailyMetric[];
   readonly aggregatedMetrics?: AggregatedPeriodMetricsResult;
@@ -443,6 +448,7 @@ export async function getAuthenticatedOperationalDashboardUseCase(params: {
       adAccounts: adAccountsVm,
       members: membersVm,
       integrations: integrationsVm,
+      googleAdsConfigStatus: getGoogleAdsOAuthConfigurationStatus(),
       campaigns: normalizedCampaigns,
       dailyMetrics: [...aggregated.timeline],
       aggregatedMetrics: aggregated,

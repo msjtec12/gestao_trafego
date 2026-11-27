@@ -186,9 +186,110 @@ export function requireOAuthStateSigningSecret(
   return candidate;
 }
 
+export const OFFICIAL_GOOGLE_ADS_CALLBACK_PATH =
+  "/api/integrations/google-ads/callback";
+
+export interface GoogleAdsOAuthConfigStatus {
+  readonly configured: boolean;
+  readonly authMode: "GOOGLE_CLOUD_PROJECT_OAUTH";
+  readonly developerTokenRequired: false;
+  readonly missingVariables: readonly string[];
+  readonly callbackUrl: string;
+  readonly callbackUrlValid: boolean;
+  readonly callbackUrlError: string | null;
+}
+
 /**
- * Requires official Google Ads OAuth 2.0 credentials (`GOOGLE_ADS_CLIENT_ID` and `GOOGLE_ADS_CLIENT_SECRET`).
- * Fails closed if missing or placeholder.
+ * Validates the official Google Ads OAuth 2.0 callback URL derived from `NEXT_PUBLIC_APP_URL`.
+ * Enforces HTTPS in production/Vercel and exact path `/api/integrations/google-ads/callback`.
+ */
+export function validateOfficialGoogleAdsCallbackUrl(
+  rawAppUrl: string,
+  rawEnv: Record<string, string | undefined> = process.env
+): {
+  readonly valid: boolean;
+  readonly callbackUrl: string;
+  readonly error: string | null;
+} {
+  const invalid = (error: string) => ({
+    valid: false as const,
+    callbackUrl: "",
+    error,
+  });
+  let base: URL;
+  try {
+    base = new URL(rawAppUrl.trim());
+  } catch {
+    return invalid("URL de callback inválida. Verifique NEXT_PUBLIC_APP_URL.");
+  }
+  const isProduction =
+    rawEnv.NODE_ENV === "production" ||
+    rawEnv.VERCEL === "1" ||
+    Boolean(rawEnv.VERCEL_ENV);
+  const isLocalhost = ["localhost", "127.0.0.1", "[::1]"].includes(base.hostname);
+  if (base.username || base.password || base.search || base.hash || base.pathname !== "/") {
+    return invalid("NEXT_PUBLIC_APP_URL deve conter apenas a origem, sem credenciais, caminho, query ou fragmento.");
+  }
+  if (base.protocol !== "https:" && !(base.protocol === "http:" && isLocalhost && !isProduction)) {
+    return invalid("A URL de callback do Google Ads deve utilizar HTTPS, exceto HTTP local em desenvolvimento.");
+  }
+  if (isProduction && isLocalhost) {
+    return invalid("A URL de callback em produção não pode apontar para localhost.");
+  }
+  const parsed = new URL(OFFICIAL_GOOGLE_ADS_CALLBACK_PATH, base.origin);
+
+  return {
+    valid: true,
+    callbackUrl: parsed.toString(),
+    error: null,
+  };
+}
+
+/**
+ * Returns non-secret real configuration status of the Google Ads OAuth 2.0 integration
+ * aligned with the September 9, 2026 Google Ads API policy (Google Cloud Project authorization,
+ * no mandatory `GOOGLE_ADS_DEVELOPER_TOKEN`).
+ */
+function resolveGoogleAdsAppUrl(rawEnv: Record<string, string | undefined>): string {
+  return rawEnv.NEXT_PUBLIC_APP_URL?.trim() ||
+    (rawEnv.NEXT_PUBLIC_APP_DOMAIN?.trim()
+      ? `https://${rawEnv.NEXT_PUBLIC_APP_DOMAIN.trim()}`
+      : "http://localhost:3000");
+}
+
+export function getGoogleAdsOAuthConfigurationStatus(
+  rawEnv: Record<string, string | undefined> = process.env
+): GoogleAdsOAuthConfigStatus {
+  const missingVariables: string[] = [];
+  const clientId = rawEnv.GOOGLE_ADS_CLIENT_ID?.trim() ?? "";
+  const clientSecret = rawEnv.GOOGLE_ADS_CLIENT_SECRET?.trim() ?? "";
+
+  if (!clientId || clientId.startsWith("replace_with_")) {
+    missingVariables.push("GOOGLE_ADS_CLIENT_ID");
+  }
+  if (!clientSecret || clientSecret.startsWith("replace_with_")) {
+    missingVariables.push("GOOGLE_ADS_CLIENT_SECRET");
+  }
+
+  const appUrl = resolveGoogleAdsAppUrl(rawEnv);
+
+  const callbackCheck = validateOfficialGoogleAdsCallbackUrl(appUrl, rawEnv);
+
+  return {
+    configured: missingVariables.length === 0 && callbackCheck.valid,
+    authMode: "GOOGLE_CLOUD_PROJECT_OAUTH",
+    developerTokenRequired: false,
+    missingVariables,
+    callbackUrl: callbackCheck.callbackUrl,
+    callbackUrlValid: callbackCheck.valid,
+    callbackUrlError: callbackCheck.error,
+  };
+}
+
+/**
+ * Requires official Google Ads OAuth 2.0 credentials (`GOOGLE_ADS_CLIENT_ID` and `GOOGLE_ADS_CLIENT_SECRET`)
+ * and validates the official callback URL. `GOOGLE_ADS_DEVELOPER_TOKEN` is NOT required (Sep 9, 2026 policy).
+ * Fails closed if missing, placeholder, or invalid callback URL.
  */
 export function requireGoogleAdsOAuthConfig(
   rawEnv: Record<string, string | undefined> = process.env
@@ -197,6 +298,7 @@ export function requireGoogleAdsOAuthConfig(
   readonly clientSecret: string;
   readonly stateSigningSecret: string;
   readonly appUrl: string;
+  readonly redirectUri: string;
 } {
   const clientId = rawEnv.GOOGLE_ADS_CLIENT_ID?.trim() ?? "";
   const clientSecret = rawEnv.GOOGLE_ADS_CLIENT_SECRET?.trim() ?? "";
@@ -204,23 +306,33 @@ export function requireGoogleAdsOAuthConfig(
   if (!clientId || clientId.startsWith("replace_with_")) {
     throw new MissingOrWeakSecretError(
       "GOOGLE_ADS_CLIENT_ID",
-      "GOOGLE_ADS_CLIENT_ID não está configurado com credenciais oficiais do Google Cloud."
+      "GOOGLE_ADS_CLIENT_ID não está configurado com credenciais oficiais do projeto Google Cloud."
     );
   }
   if (!clientSecret || clientSecret.startsWith("replace_with_")) {
     throw new MissingOrWeakSecretError(
       "GOOGLE_ADS_CLIENT_SECRET",
-      "GOOGLE_ADS_CLIENT_SECRET não está configurado com credenciais oficiais do Google Cloud."
+      "GOOGLE_ADS_CLIENT_SECRET não está configurado com credenciais oficiais do projeto Google Cloud."
     );
   }
 
   const stateSigningSecret = requireOAuthStateSigningSecret(rawEnv);
-  const appUrl = rawEnv.NEXT_PUBLIC_APP_URL?.trim() || "http://localhost:3000";
+  const appUrl = resolveGoogleAdsAppUrl(rawEnv).replace(/\/+$/, "");
+
+  const callbackCheck = validateOfficialGoogleAdsCallbackUrl(appUrl, rawEnv);
+  if (!callbackCheck.valid) {
+    throw new MissingOrWeakSecretError(
+      "NEXT_PUBLIC_APP_URL",
+      callbackCheck.error ??
+        "URL de callback oficial do Google Ads inválida."
+    );
+  }
 
   return {
     clientId,
     clientSecret,
     stateSigningSecret,
     appUrl,
+    redirectUri: callbackCheck.callbackUrl,
   };
 }

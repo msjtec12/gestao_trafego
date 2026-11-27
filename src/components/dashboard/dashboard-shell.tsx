@@ -32,6 +32,14 @@ import { EmergencyStopAlertBanner } from "./emergency-stop-control";
 import { DashboardOverview } from "./dashboard-overview";
 import { CommandPalette } from "./command-palette";
 
+import type { GoogleAdsOAuthConfigStatus } from "@/security/env";
+
+export interface GoogleAdsUiNotice {
+  readonly status: "connected" | "error";
+  readonly code: string | null;
+  readonly message: string;
+}
+
 export interface DashboardShellProps {
   readonly organizationName: string;
   readonly organizationId: string;
@@ -43,6 +51,8 @@ export interface DashboardShellProps {
   readonly adAccounts?: readonly AdAccountRecordViewModel[];
   readonly members?: readonly MemberRecordViewModel[];
   readonly integrations?: readonly IntegrationHealthViewModel[];
+  readonly googleAdsConfigStatus?: GoogleAdsOAuthConfigStatus;
+  readonly googleAdsNotice?: GoogleAdsUiNotice | null;
   readonly syncHistory?: readonly SyncRunViewModel[];
   readonly auditTrail?: readonly AuditEventViewModel[];
   readonly campaigns: NormalizedCampaign[];
@@ -89,6 +99,8 @@ export function DashboardShell({
   adAccounts = [],
   members = [],
   integrations = [],
+  googleAdsConfigStatus,
+  googleAdsNotice = null,
   syncHistory = [],
   auditTrail = [],
   campaigns,
@@ -215,6 +227,33 @@ export function DashboardShell({
           onRestore={handleToggleEmergencyStop}
         />
 
+        {googleAdsNotice && (
+          <div
+            role={googleAdsNotice.status === "error" ? "alert" : "status"}
+            data-testid="google-ads-oauth-notice"
+            className={`mx-4 sm:mx-6 mt-4 rounded-xl border px-4 py-3 text-xs space-y-1 ${
+              googleAdsNotice.status === "connected"
+                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
+                : "border-amber-500/40 bg-amber-500/10 text-amber-900 dark:text-amber-200"
+            }`}
+          >
+            <p className="font-semibold">
+              {googleAdsNotice.status === "connected"
+                ? "Integração Google Ads conectada (READ_ONLY)"
+                : "Aviso da integração Google Ads"}
+            </p>
+            <p>{googleAdsNotice.message}</p>
+            {googleAdsNotice.code ===
+              "CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION" && (
+              <p className="text-[11px] opacity-90">
+                Ação recomendada: acesse Google Cloud Console → Google Ads API
+                Overview para solicitar aprovação de produção (Explorer, Basic
+                ou Standard) ou conecte uma conta de teste do Google Ads.
+              </p>
+            )}
+          </div>
+        )}
+
         <DashboardOverview
           organizationName={activeOrganization.name}
           activeOrganization={activeOrganization}
@@ -224,6 +263,7 @@ export function DashboardShell({
           adAccounts={adAccounts}
           members={members}
           integrations={integrations}
+          googleAdsConfigStatus={googleAdsConfigStatus}
           syncHistory={syncHistory}
           auditTrail={auditTrail}
           campaigns={campaigns}
