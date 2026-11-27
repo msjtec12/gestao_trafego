@@ -46,6 +46,15 @@ const ClientCreateSchema = z.object({
     .string()
     .min(3, "Informe o segmento com pelo menos 3 caracteres.")
     .max(100),
+  websiteUrl: z
+    .string()
+    .trim()
+    .optional()
+    .refine(
+      (val) =>
+        !val || val.startsWith("https://") || val.startsWith("http://"),
+      { message: "Informe uma URL válida iniciando com https:// ou http://." }
+    ),
   monthlyBudgetCapBrl: z.coerce
     .number()
     .refine((n) => Number.isFinite(n) && n > 0, {
@@ -56,10 +65,28 @@ const ClientCreateSchema = z.object({
     .refine((n) => Number.isFinite(n) && n > 0, {
       message: "A meta de CPA deve ser positiva.",
     }),
+  targetRoas: z
+    .union([z.string(), z.number()])
+    .optional()
+    .transform((v) => {
+      if (v === undefined || v === null || String(v).trim() === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n > 0 ? n.toFixed(2) : null;
+    }),
 });
 
 const ClientUpdateSchema = ClientCreateSchema.extend({
   clientId: z.string().uuid("ID de cliente inválido."),
+});
+
+const OrganizationProfileSchema = z.object({
+  name: z
+    .string()
+    .trim()
+    .min(2, "O nome da organização deve ter pelo menos 2 caracteres.")
+    .max(160),
+  timezone: z.string().trim().min(3).max(64),
+  currencyCode: z.enum(["BRL", "USD", "EUR"]),
 });
 
 export async function loginUserAction(rawInput: {
@@ -257,8 +284,10 @@ export async function switchOrganizationAction(
 export async function createClientServerAction(rawInput: {
   readonly name: string;
   readonly industry: string;
+  readonly websiteUrl?: string;
   readonly monthlyBudgetCapBrl: number | string;
   readonly targetCpaBrl: number | string;
+  readonly targetRoas?: number | string;
 }): Promise<{
   readonly ok: boolean;
   readonly error?: string;
@@ -268,6 +297,7 @@ export async function createClientServerAction(rawInput: {
     readonly organizationId: string;
     readonly name: string;
     readonly industry: string;
+    readonly websiteUrl: string | null;
     readonly monthlyBudgetCapBrl: number;
     readonly targetCpaBrl: number | null;
     readonly targetRoas: number | null;
@@ -290,14 +320,18 @@ export async function createClientServerAction(rawInput: {
       return await repo.createClient(session.context, {
         name: parsed.data.name,
         industry: parsed.data.industry,
+        websiteUrl: parsed.data.websiteUrl || undefined,
         monthlyBudgetCapCents: Math.round(
           parsed.data.monthlyBudgetCapBrl * 100
         ),
         targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+        targetRoas: parsed.data.targetRoas ?? undefined,
       });
     });
 
     revalidatePath("/");
+    revalidatePath("/clientes");
+    revalidatePath("/orcamentos");
     return {
       ok: true,
       clientId: created.id,
@@ -306,6 +340,7 @@ export async function createClientServerAction(rawInput: {
         organizationId: created.organizationId,
         name: created.name,
         industry: created.industry,
+        websiteUrl: created.websiteUrl ?? null,
         monthlyBudgetCapBrl: Number(
           (Number(created.monthlyBudgetCapCents) / 100).toFixed(2)
         ),
@@ -329,8 +364,10 @@ export async function updateClientServerAction(rawInput: {
   readonly clientId: string;
   readonly name: string;
   readonly industry: string;
+  readonly websiteUrl?: string;
   readonly monthlyBudgetCapBrl: number | string;
   readonly targetCpaBrl: number | string;
+  readonly targetRoas?: number | string;
 }): Promise<{ readonly ok: boolean; readonly error?: string }> {
   try {
     const parsed = ClientUpdateSchema.safeParse(rawInput);
@@ -348,14 +385,55 @@ export async function updateClientServerAction(rawInput: {
         clientId: parsed.data.clientId,
         name: parsed.data.name,
         industry: parsed.data.industry,
+        websiteUrl: parsed.data.websiteUrl ?? null,
         monthlyBudgetCapCents: Math.round(
           parsed.data.monthlyBudgetCapBrl * 100
         ),
         targetCpaCents: Math.round(parsed.data.targetCpaBrl * 100),
+        targetRoas: parsed.data.targetRoas,
       });
     });
 
     revalidatePath("/");
+    revalidatePath("/clientes");
+    revalidatePath(`/clientes/${parsed.data.clientId}`);
+    revalidatePath("/orcamentos");
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error: toPublicSafeErrorMessage(err).publicMessage,
+    };
+  }
+}
+
+export async function updateOrganizationProfileServerAction(rawInput: {
+  readonly name: string;
+  readonly timezone: string;
+  readonly currencyCode: "BRL" | "USD" | "EUR";
+}): Promise<{ readonly ok: boolean; readonly error?: string }> {
+  try {
+    const parsed = OrganizationProfileSchema.safeParse(rawInput);
+    if (!parsed.success) {
+      return {
+        ok: false,
+        error:
+          parsed.error.issues[0]?.message ?? "Dados da organização inválidos.",
+      };
+    }
+
+    const session = await resolveUnifiedAuthJsPostgresSession();
+    await withTenantTransaction(session.context, async (tx) => {
+      const repo = new PersistentDrizzleTenantRepository(tx);
+      await repo.updateOrganizationSettings(session.context, {
+        name: parsed.data.name,
+        timezone: parsed.data.timezone,
+        currencyCode: parsed.data.currencyCode,
+      });
+    });
+
+    revalidatePath("/");
+    revalidatePath("/configuracoes");
     return { ok: true };
   } catch (err) {
     return {
